@@ -1,0 +1,46 @@
+name: Deploy directly to EKS
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: ap-south-1
+      CLUSTER_NAME: fighting-characters
+      NAMESPACE: fighting-characters
+      DEPLOYMENT: fighting-characters
+      IMAGE: 372595555088.dkr.ecr.ap-south-1.amazonaws.com/fighting-characters
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::372595555088:role/gh-oidc-eks-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: Set image and rollout
+        run: |
+          kubectl set image deployment/${{ env.DEPLOYMENT }} \
+            app=${{ env.IMAGE }}:${{ env.IMAGE_TAG }} \
+            -n $NAMESPACE
+          kubectl rollout status deployment/${{ env.DEPLOYMENT }} -n $NAMESPACE --timeout=180s
+
+      - name: Show Service address
+        run: kubectl get svc $DEPLOYMENT -n $NAMESPACE -o wide
