@@ -33,6 +33,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Resolve inputs (manual) or repository_dispatch payload (automatic)
       - name: Resolve inputs/payload
         run: |
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
@@ -45,6 +46,7 @@ jobs:
             echo "AWS_REGION=${{ inputs.region }}" >> $GITHUB_ENV
           fi
 
+      # Assume the AWS role via OIDC
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -63,29 +65,41 @@ jobs:
       - name: Show repo tree
         run: |
           echo "PWD=$(pwd)"
+          git rev-parse --abbrev-ref HEAD || true
           ls -la
           echo "---- recursive ----"
           ls -R || true
 
-      - name: Locate manifests dir
+      # Auto-detect manifests location and filenames
+      - name: Locate manifests
+        id: locate
         run: |
           set -e
-          if [ -f k8/deployment.yaml ]; then
-            echo "MANIFEST_DIR=k8" >> $GITHUB_ENV
-          elif [ -f k8s/deployment.yaml ]; then
-            echo "MANIFEST_DIR=k8s" >> $GITHUB_ENV
-          elif [ -f deployment.yaml ]; then
-            echo "MANIFEST_DIR=." >> $GITHUB_ENV
-          else
-            echo "deployment.yaml not found in k8/, k8s/, or repo root" >&2
+          DEPLOY_PATH="$(git ls-files | grep -Ei '(^|/)(k8|k8s|manifests)/deployment\.ya?ml$|(^|/)deployment\.ya?ml$' | head -n1 || true)"
+          SERVICE_PATH="$(git ls-files | grep -Ei '(^|/)(k8|k8s|manifests)/service\.ya?ml$|(^|/)service\.ya?ml$' | head -n1 || true)"
+
+          if [ -z "$DEPLOY_PATH" ]; then
+            echo "deployment.yaml not found in repo (expected e.g. k8/deployment.yaml)" >&2
             exit 1
           fi
 
+          echo "deploy=$DEPLOY_PATH"  >> "$GITHUB_OUTPUT"
+          echo "service=$SERVICE_PATH" >> "$GITHUB_OUTPUT"
+          echo "Found deployment: $DEPLOY_PATH"
+          [ -n "$SERVICE_PATH" ] && echo "Found service: $SERVICE_PATH" || echo "No service.yaml (will skip)"
+
+      - name: Validate deployment placeholder
+        run: |
+          if ! grep -q '__IMAGE_TAG__' "${{ steps.locate.outputs.deploy }}"; then
+            echo "Placeholder __IMAGE_TAG__ not found in ${{ steps.locate.outputs.deploy }}"; exit 1
+          fi
+          echo "Using IMAGE_TAG=${IMAGE_TAG}"
+
       - name: Render & apply manifests
         run: |
-          sed -e "s#__IMAGE_TAG__#${IMAGE_TAG}#g" "$MANIFEST_DIR/deployment.yaml" | kubectl apply -f -
-          if [ -f "$MANIFEST_DIR/service.yaml" ]; then
-            kubectl apply -f "$MANIFEST_DIR/service.yaml"
+          sed -e "s#__IMAGE_TAG__#${IMAGE_TAG}#g" "${{ steps.locate.outputs.deploy }}" | kubectl apply -f -
+          if [ -n "${{ steps.locate.outputs.service }}" ]; then
+            kubectl apply -f "${{ steps.locate.outputs.service }}"
           fi
 
       - name: Wait for rollout
