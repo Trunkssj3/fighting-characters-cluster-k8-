@@ -4,9 +4,9 @@ metadata:
   name: fighting-characters
   namespace: fighting-characters
 spec:
+  type: LoadBalancer
   selector:
     app: fighting-characters
   ports:
     - port: 80
       targetPort: 8000
-  type: ClusterIP
