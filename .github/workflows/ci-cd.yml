@@ -35,7 +35,9 @@ jobs:
 
       # Resolve inputs (manual) or repository_dispatch payload (automatic)
       - name: Resolve inputs/payload
+        shell: bash
         run: |
+          set -euo pipefail
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             echo "IMAGE_TAG=${{ github.event.client_payload.image_tag }}" >> $GITHUB_ENV
             echo "ECR_REPOSITORY=${{ github.event.client_payload.ecr_repository }}" >> $GITHUB_ENV
@@ -45,6 +47,7 @@ jobs:
             echo "ECR_REPOSITORY=${{ inputs.ecr_repository }}" >> $GITHUB_ENV
             echo "AWS_REGION=${{ inputs.region }}" >> $GITHUB_ENV
           fi
+          echo "Resolved: IMAGE_TAG=$IMAGE_TAG, ECR_REPOSITORY=$ECR_REPOSITORY, AWS_REGION=$AWS_REGION"
 
       # Assume the AWS role via OIDC
       - name: Configure AWS (OIDC)
@@ -63,6 +66,7 @@ jobs:
         run: kubectl get ns "$K8S_NAMESPACE" || kubectl create ns "$K8S_NAMESPACE"
 
       - name: Show repo tree
+        shell: bash
         run: |
           echo "PWD=$(pwd)"
           git rev-parse --abbrev-ref HEAD || true
@@ -70,25 +74,58 @@ jobs:
           echo "---- recursive ----"
           ls -R || true
 
-      # Auto-detect manifests location and filenames
-      - name: Locate manifests
+      # Auto-detect manifests (robust, filesystem-based)
+      - name: Locate manifests (robust)
         id: locate
+        shell: bash
         run: |
-          set -e
-          DEPLOY_PATH="$(git ls-files | grep -Ei '(^|/)(k8|k8s|manifests)/deployment\.ya?ml$|(^|/)deployment\.ya?ml$' | head -n1 || true)"
-          SERVICE_PATH="$(git ls-files | grep -Ei '(^|/)(k8|k8s|manifests)/service\.ya?ml$|(^|/)service\.ya?ml$' | head -n1 || true)"
+          set -euo pipefail
 
+          # Find deployment (first that exists)
+          DEPLOY_CANDIDATES=(
+            "k8/deployment.yaml"
+            "k8s/deployment.yaml"
+            "manifests/deployment.yaml"
+            "deployment.yaml"
+          )
+          DEPLOY_PATH=""
+          for p in "${DEPLOY_CANDIDATES[@]}"; do
+            if [ -f "$p" ]; then
+              DEPLOY_PATH="$p"
+              break
+            fi
+          done
           if [ -z "$DEPLOY_PATH" ]; then
-            echo "deployment.yaml not found in repo (expected e.g. k8/deployment.yaml)" >&2
+            echo "No deployment manifest found (checked: ${DEPLOY_CANDIDATES[*]})" >&2
             exit 1
           fi
+
+          # Find service (support both service.yaml and services.yaml)
+          SERVICE_CANDIDATES=(
+            "k8/service.yaml" "k8/services.yaml"
+            "k8s/service.yaml" "k8s/services.yaml"
+            "manifests/service.yaml" "manifests/services.yaml"
+            "service.yaml" "services.yaml"
+          )
+          SERVICE_PATH=""
+          for p in "${SERVICE_CANDIDATES[@]}"; do
+            if [ -f "$p" ]; then
+              SERVICE_PATH="$p"
+              break
+            fi
+          done
 
           echo "deploy=$DEPLOY_PATH"  >> "$GITHUB_OUTPUT"
           echo "service=$SERVICE_PATH" >> "$GITHUB_OUTPUT"
           echo "Found deployment: $DEPLOY_PATH"
-          [ -n "$SERVICE_PATH" ] && echo "Found service: $SERVICE_PATH" || echo "No service.yaml (will skip)"
+          if [ -n "$SERVICE_PATH" ]; then
+            echo "Found service: $SERVICE_PATH"
+          else
+            echo "No service manifest found (will skip)"
+          fi
 
       - name: Validate deployment placeholder
+        shell: bash
         run: |
           if ! grep -q '__IMAGE_TAG__' "${{ steps.locate.outputs.deploy }}"; then
             echo "Placeholder __IMAGE_TAG__ not found in ${{ steps.locate.outputs.deploy }}"; exit 1
@@ -96,8 +133,12 @@ jobs:
           echo "Using IMAGE_TAG=${IMAGE_TAG}"
 
       - name: Render & apply manifests
+        shell: bash
         run: |
+          # Render the image tag into the deployment yaml and apply
           sed -e "s#__IMAGE_TAG__#${IMAGE_TAG}#g" "${{ steps.locate.outputs.deploy }}" | kubectl apply -f -
+
+          # Apply service if present
           if [ -n "${{ steps.locate.outputs.service }}" ]; then
             kubectl apply -f "${{ steps.locate.outputs.service }}"
           fi
