@@ -18,4 +18,5 @@ spec:
           image: 372595555088.dkr.ecr.ap-south-1.amazonaws.com/fightingcharacters:__IMAGE_TAG__
           imagePullPolicy: Always
           ports:
-            - containerPort: 8000
+            - containerPort: 5000
+
