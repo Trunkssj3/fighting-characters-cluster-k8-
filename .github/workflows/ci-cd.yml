@@ -39,25 +39,32 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            echo "IMAGE_TAG=${{ github.event.client_payload.image_tag }}" >> $GITHUB_ENV
-            echo "ECR_REPOSITORY=${{ github.event.client_payload.ecr_repository }}" >> $GITHUB_ENV
-            echo "AWS_REGION=${{ github.event.client_payload.region }}" >> $GITHUB_ENV
-          else
-            echo "IMAGE_TAG=${{ inputs.image_tag }}" >> $GITHUB_ENV   # may be empty -> we'll auto-pick later
-            echo "ECR_REPOSITORY=${{ inputs.ecr_repository }}" >> $GITHUB_ENV
-            echo "AWS_REGION=${{ inputs.region }}" >> $GITHUB_ENV
-          fi
-          echo "Resolved (may be empty): IMAGE_TAG=$IMAGE_TAG, ECR_REPOSITORY=$ECR_REPOSITORY, AWS_REGION=$AWS_REGION"
 
-      # Assume the AWS role via OIDC
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            IMAGE_TAG_IN="${{ github.event.client_payload.image_tag }}"
+            ECR_REPO_IN="${{ github.event.client_payload.ecr_repository }}"
+            AWS_REGION_IN="${{ github.event.client_payload.region }}"
+          else
+            IMAGE_TAG_IN="${{ inputs.image_tag }}"
+            ECR_REPO_IN="${{ inputs.ecr_repository }}"
+            AWS_REGION_IN="${{ inputs.region }}"
+          fi
+
+          # Export to later steps
+          echo "IMAGE_TAG=${IMAGE_TAG_IN}"       >> "$GITHUB_ENV"
+          echo "ECR_REPOSITORY=${ECR_REPO_IN}"   >> "$GITHUB_ENV"
+          echo "AWS_REGION=${AWS_REGION_IN}"     >> "$GITHUB_ENV"
+
+          echo "Resolved (may be empty): IMAGE_TAG=${IMAGE_TAG_IN:-}, ECR_REPOSITORY=${ECR_REPO_IN:-}, AWS_REGION=${AWS_REGION_IN:-}"
+
+      # Configure AWS via OIDC (use static inputs/payload so it works before $GITHUB_ENV takes effect)
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ env.ACCOUNT_ID }}:role/gh-oidc-eks-deploy
           aws-region: ${{ github.event.client_payload.region || inputs.region || 'ap-south-1' }}
 
-      # If IMAGE_TAG is empty (manual run without input), auto-pick the most recent tag from ECR
+      # If IMAGE_TAG is empty (manual run), auto-pick the most recent tag from ECR
       - name: Auto-pick latest image tag if missing
         if: env.IMAGE_TAG == ''
         shell: bash
@@ -72,7 +79,7 @@ jobs:
             echo "Failed to auto-detect an image tag in ECR repo '$ECR_REPOSITORY'." >&2
             exit 1
           fi
-          echo "IMAGE_TAG=$TAG" >> $GITHUB_ENV
+          echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
           echo "Auto-selected IMAGE_TAG=$TAG"
 
       - name: Sanity - can call EKS?
@@ -118,7 +125,7 @@ jobs:
             if [ -f "$p" ]; then SERVICE_PATH="$p"; break; fi
           done
 
-          echo "deploy=$DEPLOY_PATH"  >> "$GITHUB_OUTPUT"
+          echo "deploy=$DEPLOY_PATH"   >> "$GITHUB_OUTPUT"
           echo "service=$SERVICE_PATH" >> "$GITHUB_OUTPUT"
           echo "Found deployment: $DEPLOY_PATH"
           if [ -n "$SERVICE_PATH" ]; then echo "Found service: $SERVICE_PATH"; else echo "No service manifest found (will skip)"; fi
