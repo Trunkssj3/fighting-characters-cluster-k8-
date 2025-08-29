@@ -96,8 +96,9 @@ jobs:
       - name: Deploy to Kubernetes
         run: |
           kubectl set image deployment/fighting-characters \
-            app=372595555088.dkr.ecr.ap-south-1.amazonaws.com/fightingcharacters:${{ env.IMAGE_TAG }} \
-            -n fighting-characters
+          fighting-characters=372595555088.dkr.ecr.ap-south-1.amazonaws.com/fightingcharacters:${{ env.IMAGE_TAG }} \
+          -n fighting-characters
+
 
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name fighting-characters-cluster --region ${{ env.AWS_REGION }}
@@ -165,4 +166,5 @@ jobs:
 
       - name: Wait for rollout
         run: kubectl rollout status deploy/fighting-characters -n "$K8S_NAMESPACE" --timeout=5m
+
 
