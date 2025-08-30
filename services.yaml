@@ -10,7 +10,7 @@ spec:
   ports:
     - name: http
       port: 80
-      targetPort: 5000
+      targetPort: http
 ---
 apiVersion: v1
 kind: Service
@@ -21,6 +21,6 @@ spec:
   selector:
     app: mongo
   ports:
-    - port: 27017
+    - name: mongo
+      port: 27017
       targetPort: 27017
-
