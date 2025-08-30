@@ -27,10 +27,11 @@ spec:
           ports:
             - name: http
               containerPort: 5000
-          # מריץ Gunicorn מפורש כדי לוודא מודול נכון + graceful timeouts
           command: ["gunicorn"]
           args: ["-w","3","-b","0.0.0.0:5000","app.app:app","--timeout","60","--graceful-timeout","30"]
           env:
+            - name: PYTHONPATH
+              value: "/app/app"
             - name: MONGO_URI
               value: "mongodb://mongo:27017/fighting_characters"
             - name: DB_NAME
@@ -41,7 +42,6 @@ spec:
               value: "prod-secret"
             - name: SEED_ON_START
               value: "false"
-          # זמן אתחול נדיב כדי למנוע false negatives
           startupProbe:
             httpGet:
               path: /health
