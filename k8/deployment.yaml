@@ -33,16 +33,19 @@ spec:
           args:
             - |
               set -e
-              # שים את שתי הספריות ב-PYTHONPATH כדי ליישר imports כמו 'from utils import ...'
-              export PYTHONPATH="${PYTHONPATH:-/app:/app/app}"
+              # יישור imports: הוסף שתי ספריות ל-PYTHONPATH
+              export PYTHONPATH="/app:/app/app:${PYTHONPATH:-}"
               if [ -f /app/app/app.py ]; then
-                MOD="app.app:app"
+                cd /app/app
+                MOD="app:app"
               elif [ -f /app/app.py ]; then
+                cd /app
                 MOD="app:app"
               else
-                echo "Cannot find app.py at /app/app/app.py or /app/app.py"; exit 1
+                echo "Cannot find app.py at /app/app/app.py or /app/app.py"
+                exit 1
               fi
-              echo "[startup] Using module: $MOD"
+              echo "[startup] Using module: $MOD in $(pwd) PYTHONPATH=$PYTHONPATH"
               exec gunicorn -w 3 -b 0.0.0.0:5000 "$MOD" --timeout 60 --graceful-timeout 30
 
           env:
@@ -118,6 +121,3 @@ spec:
           ports:
             - containerPort: 27017
           resources:
-            requests:
-              cpu: "100m"
-              memory: "128Mi"
