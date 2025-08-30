@@ -26,6 +26,8 @@ env:
   ACCOUNT_ID: "372595555088"
   CLUSTER_NAME: "fighting-characters-cluster"
   K8S_NAMESPACE: "fighting-characters"
+  DEPLOYMENT_NAME: "fighting-characters"   # must match your Deployment
+  CONTAINER_NAME: "fighting-characters"    # must match container name in the Deployment
 
 jobs:
   deploy:
@@ -39,7 +41,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             IMAGE_TAG_IN="${{ github.event.client_payload.image_tag }}"
             ECR_REPO_IN="${{ github.event.client_payload.ecr_repository }}"
@@ -49,22 +50,19 @@ jobs:
             ECR_REPO_IN="${{ inputs.ecr_repository }}"
             AWS_REGION_IN="${{ inputs.region }}"
           fi
+          echo "IMAGE_TAG=${IMAGE_TAG_IN}"     >> "$GITHUB_ENV"
+          echo "ECR_REPOSITORY=${ECR_REPO_IN}" >> "$GITHUB_ENV"
+          echo "AWS_REGION=${AWS_REGION_IN}"   >> "$GITHUB_ENV"
+          echo "Resolved -> IMAGE_TAG='${IMAGE_TAG_IN}', ECR_REPOSITORY='${ECR_REPO_IN}', AWS_REGION='${AWS_REGION_IN}'"
 
-          # Export to later steps
-          echo "IMAGE_TAG=${IMAGE_TAG_IN}"       >> "$GITHUB_ENV"
-          echo "ECR_REPOSITORY=${ECR_REPO_IN}"   >> "$GITHUB_ENV"
-          echo "AWS_REGION=${AWS_REGION_IN}"     >> "$GITHUB_ENV"
-
-          echo "Resolved (may be empty): IMAGE_TAG=${IMAGE_TAG_IN:-}, ECR_REPOSITORY=${ECR_REPO_IN:-}, AWS_REGION=${AWS_REGION_IN:-}"
-
-      # Configure AWS via OIDC (use static inputs/payload so it works before $GITHUB_ENV takes effect)
+      # Configure AWS via OIDC
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ env.ACCOUNT_ID }}:role/gh-oidc-eks-deploy
-          aws-region: ${{ github.event.client_payload.region || inputs.region || 'ap-south-1' }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      # If IMAGE_TAG is empty (manual run), auto-pick the most recent tag from ECR
+      # Auto-pick latest image tag if missing (manual run)
       - name: Auto-pick latest image tag if missing
         if: env.IMAGE_TAG == ''
         shell: bash
@@ -76,96 +74,36 @@ jobs:
                 --query "reverse(sort_by(imageDetails,&imagePushedAt))[0].imageTags[0]" \
                 --output text)
           if [ -z "$TAG" ] || [ "$TAG" = "None" ]; then
-            echo "Failed to auto-detect an image tag in ECR repo '$ECR_REPOSITORY'." >&2
+            echo "No tags found in ECR repo '$ECR_REPOSITORY'." >&2
             exit 1
           fi
           echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
           echo "Auto-selected IMAGE_TAG=$TAG"
 
-      - name: Sanity - can call EKS?
-        run: aws eks describe-cluster --name "$CLUSTER_NAME" --region "$AWS_REGION"
-
+      # Kubeconfig once
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
 
-      - name: Ensure namespace exists
-        run: kubectl get ns "$K8S_NAMESPACE" || kubectl create ns "$K8S_NAMESPACE"
-      - name: Update kubeconfig
-        run: aws eks update-kubeconfig --name fighting-characters-cluster --region ${{ env.AWS_REGION }}
-
-      - name: Deploy to Kubernetes
+      # Ensure namespace + apply base manifests (Deployment/Service from k8/)
+      - name: Apply base manifests (idempotent)
         run: |
-          kubectl set image deployment/fighting-characters \
-          fighting-characters=372595555088.dkr.ecr.ap-south-1.amazonaws.com/fightingcharacters:${{ env.IMAGE_TAG }} \
-          -n fighting-characters
+          kubectl get ns "$K8S_NAMESPACE" || kubectl create ns "$K8S_NAMESPACE"
+          kubectl apply -n "$K8S_NAMESPACE" -f k8/
 
-
-      - name: Update kubeconfig
-        run: aws eks update-kubeconfig --name fighting-characters-cluster --region ${{ env.AWS_REGION }}
-
-      - name: Deploy to Kubernetes
-        run: |
-          kubectl set image deployment/fighting-characters \
-            fighting-characters=372595555088.dkr.ecr.ap-south-1.amazonaws.com/fightingcharacters:${{ env.IMAGE_TAG }} \
-            -n fighting-characters
-
-      - name: Show repo tree
-        shell: bash
-        run: |
-          echo "PWD=$(pwd)"
-          git rev-parse --abbrev-ref HEAD || true
-          ls -la
-          echo "---- recursive ----"
-          ls -R || true
-
-      # Auto-detect manifests (filesystem-based)
-      - name: Locate manifests (robust)
-        id: locate
-        shell: bash
+      # Set the ECR image on the known Deployment/Container
+      - name: Deploy to Kubernetes (set image)
+        env:
+          FULL_IMAGE: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
         run: |
           set -euo pipefail
-
-          # Find deployment
-          DEPLOY_CANDIDATES=( "k8/deployment.yaml" "k8s/deployment.yaml" "manifests/deployment.yaml" "deployment.yaml" )
-          DEPLOY_PATH=""
-          for p in "${DEPLOY_CANDIDATES[@]}"; do
-            if [ -f "$p" ]; then DEPLOY_PATH="$p"; break; fi
-          done
-          if [ -z "$DEPLOY_PATH" ]; then
-            echo "No deployment manifest found (checked: ${DEPLOY_CANDIDATES[*]})" >&2
-            exit 1
-          fi
-
-          # Find service (service.yaml OR services.yaml)
-          SERVICE_CANDIDATES=( "k8/service.yaml" "k8/services.yaml" "k8s/service.yaml" "k8s/services.yaml" "manifests/service.yaml" "manifests/services.yaml" "service.yaml" "services.yaml" )
-          SERVICE_PATH=""
-          for p in "${SERVICE_CANDIDATES[@]}"; do
-            if [ -f "$p" ]; then SERVICE_PATH="$p"; break; fi
-          done
-
-          echo "deploy=$DEPLOY_PATH"   >> "$GITHUB_OUTPUT"
-          echo "service=$SERVICE_PATH" >> "$GITHUB_OUTPUT"
-          echo "Found deployment: $DEPLOY_PATH"
-          if [ -n "$SERVICE_PATH" ]; then echo "Found service: $SERVICE_PATH"; else echo "No service manifest found (will skip)"; fi
-
-      - name: Validate deployment placeholder
-        shell: bash
-        run: |
-          if ! grep -q '__IMAGE_TAG__' "${{ steps.locate.outputs.deploy }}"; then
-            echo "Placeholder __IMAGE_TAG__ not found in ${{ steps.locate.outputs.deploy }}"; exit 1
-          fi
-          echo "Using IMAGE_TAG=${IMAGE_TAG}"
-
-      - name: Render & apply manifests
-        shell: bash
-        run: |
-          sed -e "s#__IMAGE_TAG__#${IMAGE_TAG}#g" "${{ steps.locate.outputs.deploy }}" | kubectl apply -f -
-          if [ -n "${{ steps.locate.outputs.service }}" ]; then
-            kubectl apply -f "${{ steps.locate.outputs.service }}"
-          fi
+          echo "Setting image to: $FULL_IMAGE"
+          kubectl -n "$K8S_NAMESPACE" set image \
+            deployment/"$DEPLOYMENT_NAME" \
+            "$CONTAINER_NAME"="$FULL_IMAGE"
 
       - name: Wait for rollout
-        run: kubectl rollout status deploy/fighting-characters -n "$K8S_NAMESPACE" --timeout=5m
+        run: kubectl rollout status deploy/"$DEPLOYMENT_NAME" -n "$K8S_NAMESPACE" --timeout=5m
 
-
-
+      - name: Show services (optional)
+        continue-on-error: true
+        run: kubectl -n "$K8S_NAMESPACE" get svc -o wide || true
