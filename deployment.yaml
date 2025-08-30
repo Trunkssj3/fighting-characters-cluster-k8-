@@ -5,6 +5,12 @@ metadata:
   namespace: fighting-characters
 spec:
   replicas: 1
+  progressDeadlineSeconds: 900
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: fighting-characters
@@ -13,12 +19,17 @@ spec:
       labels:
         app: fighting-characters
     spec:
+      terminationGracePeriodSeconds: 45
       containers:
         - name: fighting-characters
           image: 372595555088.dkr.ecr.ap-south-1.amazonaws.com/fightingcharacters:latest
           imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 5000
+            - name: http
+              containerPort: 5000
+          # מריץ Gunicorn מפורש כדי לוודא מודול נכון + graceful timeouts
+          command: ["gunicorn"]
+          args: ["-w","3","-b","0.0.0.0:5000","app.app:app","--timeout","60","--graceful-timeout","30"]
           env:
             - name: MONGO_URI
               value: "mongodb://mongo:27017/fighting_characters"
@@ -30,18 +41,30 @@ spec:
               value: "prod-secret"
             - name: SEED_ON_START
               value: "false"
+          # זמן אתחול נדיב כדי למנוע false negatives
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: 30
+            periodSeconds: 2
+            timeoutSeconds: 2
           readinessProbe:
             httpGet:
               path: /health
-              port: 5000
-            initialDelaySeconds: 5
+              port: http
+            initialDelaySeconds: 15
             periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
           livenessProbe:
             httpGet:
               path: /health
-              port: 5000
-            initialDelaySeconds: 10
+              port: http
+            initialDelaySeconds: 30
             periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
           resources:
             requests:
               cpu: "200m"
@@ -74,4 +97,3 @@ spec:
             requests:
               cpu: "100m"
               memory: "128Mi"
-
