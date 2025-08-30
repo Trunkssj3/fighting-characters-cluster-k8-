@@ -1,3 +1,60 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fighting-characters
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo
+  namespace: fighting-characters
+spec:
+  selector:
+    app: mongo
+  ports:
+    - name: mongo
+      port: 27017
+      targetPort: 27017
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongo
+  namespace: fighting-characters
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongo
+  template:
+    metadata:
+      labels:
+        app: mongo
+    spec:
+      containers:
+        - name: mongo
+          image: mongo:6
+          ports:
+            - containerPort: 27017
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fighting-characters
+  namespace: fighting-characters
+spec:
+  type: LoadBalancer
+  selector:
+    app: fighting-characters
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -19,7 +76,7 @@ spec:
       labels:
         app: fighting-characters
     spec:
-      terminationGracePeriodSeconds: 45
+      terminationGracePeriodSeconds: 60
       containers:
         - name: fighting-characters
           image: 372595555088.dkr.ecr.ap-south-1.amazonaws.com/fightingcharacters:latest
@@ -27,11 +84,10 @@ spec:
           ports:
             - name: http
               containerPort: 5000
+          # מריצים gunicorn ישירות; בהנחה שהאימג׳ נבנה עם WORKDIR=/app/app
           command: ["gunicorn"]
-          args: ["-w","3","-b","0.0.0.0:5000","app.app:app","--timeout","60","--graceful-timeout","30"]
+          args: ["-w","3","-b","0.0.0.0:5000","app:app","--timeout","60","--graceful-timeout","30"]
           env:
-            - name: PYTHONPATH
-              value: "/app/app"
             - name: MONGO_URI
               value: "mongodb://mongo:27017/fighting_characters"
             - name: DB_NAME
@@ -42,6 +98,10 @@ spec:
               value: "prod-secret"
             - name: SEED_ON_START
               value: "false"
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh","-c","sleep 5"]
           startupProbe:
             httpGet:
               path: /health
@@ -72,28 +132,3 @@ spec:
             limits:
               cpu: "500m"
               memory: "512Mi"
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: mongo
-  namespace: fighting-characters
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: mongo
-  template:
-    metadata:
-      labels:
-        app: mongo
-    spec:
-      containers:
-        - name: mongo
-          image: mongo:6
-          ports:
-            - containerPort: 27017
-          resources:
-            requests:
-              cpu: "100m"
-              memory: "128Mi"
