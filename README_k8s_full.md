@@ -11,7 +11,6 @@ This repository holds K8s manifests for:
 - **Persistent Volumes (MongoDB)**
 
 ## Architecture
-![K8s Architecture](Diagram.png)
 
 - Namespace: `fighting-characters`
 - MongoDB StatefulSet (with PersistentVolumeClaims)
@@ -66,7 +65,7 @@ Key features:
 
 ## Architecture (Detailed)
 
-![Architecture Diagram](images/k8s_architecture.png)
+![Architecture Diagram]!(Diagram.png)
 
 - **Users → Ingress (Nginx)** → Routes traffic to Flask service
 - **App Deployment** runs containerized Flask API
