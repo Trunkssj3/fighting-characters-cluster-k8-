@@ -65,7 +65,7 @@ Key features:
 
 ## Architecture (Detailed)
 
-![Architecture Diagram]!(Diagram.png)
+![Architecture Diagram](Diagram.png)
 
 - **Users → Ingress (Nginx)** → Routes traffic to Flask service
 - **App Deployment** runs containerized Flask API
