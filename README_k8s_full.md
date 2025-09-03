@@ -37,7 +37,7 @@ kubectl get svc -n fighting-characters
 
 # Fighting Characters – Kubernetes (Detailed)
 
-> Full Kubernetes deployment for the Fighting Characters portfolio project.
+> Full Kubernetes deployment for the Fighting Characters app project.
 
 ## Table of Contents
 
