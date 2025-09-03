@@ -26,8 +26,8 @@ env:
   ACCOUNT_ID: "372595555088"
   CLUSTER_NAME: "fighting-characters-cluster"
   K8S_NAMESPACE: "fighting-characters"
-  DEPLOYMENT_NAME: "fighting-characters"   # must match your Deployment
-  CONTAINER_NAME: "fighting-characters"    # must match container name in the Deployment
+  DEPLOYMENT_NAME: "fighting-characters"
+  CONTAINER_NAME: "fighting-characters"
 
 jobs:
   deploy:
@@ -36,7 +36,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Resolve inputs (manual) or repository_dispatch payload (automatic)
       - name: Resolve inputs/payload
         shell: bash
         run: |
@@ -53,92 +52,80 @@ jobs:
           echo "IMAGE_TAG=${IMAGE_TAG_IN}"     >> "$GITHUB_ENV"
           echo "ECR_REPOSITORY=${ECR_REPO_IN}" >> "$GITHUB_ENV"
           echo "AWS_REGION=${AWS_REGION_IN}"   >> "$GITHUB_ENV"
-          echo "Resolved -> IMAGE_TAG='${IMAGE_TAG_IN}', ECR_REPOSITORY='${ECR_REPO_IN}', AWS_REGION='${AWS_REGION_IN}'"
 
-      # Configure AWS via OIDC
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ env.ACCOUNT_ID }}:role/gh-oidc-eks-deploy
           aws-region: ${{ env.AWS_REGION }}
 
-      # Auto-pick latest image tag if missing (manual run)
       - name: Auto-pick latest image tag if missing
         if: env.IMAGE_TAG == ''
         shell: bash
         run: |
           set -euo pipefail
-          TAG=$(aws ecr describe-images \
-                --repository-name "$ECR_REPOSITORY" \
-                --region "$AWS_REGION" \
-                --query "reverse(sort_by(imageDetails,&imagePushedAt))[0].imageTags[0]" \
-                --output text)
-          if [ -z "$TAG" ] || [ "$TAG" = "None" ]; then
-            echo "No tags found in ECR repo '$ECR_REPOSITORY'." >&2
-            exit 1
-          fi
+          TAG=$(aws ecr describe-images                 --repository-name "$ECR_REPOSITORY"                 --region "$AWS_REGION"                 --query "reverse(sort_by(imageDetails,&imagePushedAt))[0].imageTags[0]"                 --output text)
+          [ -z "$TAG" -o "$TAG" = "None" ] && { echo "No tags found" >&2; exit 1; }
           echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
-          echo "Auto-selected IMAGE_TAG=$TAG"
+          echo "Auto-selected $TAG"
 
-      # Kubeconfig once
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
 
-      # Ensure namespace + apply base manifests (Deployment/Service from k8/)
       - name: Apply base manifests (idempotent)
         run: |
           kubectl get ns "$K8S_NAMESPACE" || kubectl create ns "$K8S_NAMESPACE"
           kubectl apply -n "$K8S_NAMESPACE" -f k8/
 
-      # Set the ECR image on the known Deployment/Container
-      - name: Deploy to Kubernetes (set image)
+      - name: Set image
         env:
           FULL_IMAGE: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
         run: |
           set -euo pipefail
-          echo "Setting image to: $FULL_IMAGE"
-          kubectl -n "$K8S_NAMESPACE" set image \
-            deployment/"$DEPLOYMENT_NAME" \
-            "$CONTAINER_NAME"="$FULL_IMAGE"
+          kubectl -n "$K8S_NAMESPACE" set image deployment/"$DEPLOYMENT_NAME" "$CONTAINER_NAME=$FULL_IMAGE"
 
-      # Robust rollout: try normally, if stuck -> scale 0 -> wait -> scale 1 -> try again
-      - name: Rollout (robust)
+      - name: Zero-downtime rollout with safe fallback
         shell: bash
         run: |
           set -euo pipefail
           ns="${K8S_NAMESPACE}"
           dep="${DEPLOYMENT_NAME}"
+          # record current replicas
+          orig=$(kubectl -n "$ns" get deploy "$dep" -o jsonpath='{.spec.replicas}')
+          [ -z "$orig" ] && orig=1
 
-          echo "==> Attempting normal rollout..."
-          if kubectl -n "$ns" rollout status deploy/"$dep" --timeout=120s; then
-            echo "Rollout completed ✅"; exit 0
+          echo "Current replicas: $orig"
+          # Ensure rolling strategy is safe (maxUnavailable=0, maxSurge=1)
+          kubectl -n "$ns" patch deploy "$dep" -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":0,"maxSurge":1}}}}' --type=merge
+
+          # If single replica, temporarily scale up by +1 to avoid downtime
+          if [ "$orig" -lt 2 ]; then
+            echo "Scaling up temporarily to 2 replicas to avoid downtime..."
+            kubectl -n "$ns" scale deploy "$dep" --replicas=2
           fi
 
-          echo "==> Rollout stuck. Forcing clean restart (scale 0 -> 1)..."
-          kubectl -n "$ns" scale deploy/"$dep" --replicas=0 || true
-          kubectl -n "$ns" wait --for=delete pod -l app="${dep}" --timeout=180s || true
-          kubectl -n "$ns" scale deploy/"$dep" --replicas=1
-
+          echo "Waiting for rollout..."
           if kubectl -n "$ns" rollout status deploy/"$dep" --timeout=300s; then
-            echo "Recovered after forced restart ✅"
+            echo "Rollout completed ✅"
+            # scale back if we scaled up
+            if [ "$orig" -lt 2 ]; then
+              echo "Scaling back to $orig..."
+              kubectl -n "$ns" scale deploy "$dep" --replicas="$orig"
+            fi
             exit 0
           fi
 
-          echo "==> Still failing. Capturing diagnostics…"
-          echo "--- ReplicaSets ---"
-          kubectl -n "$ns" get rs -l app="${dep}" -o wide || true
-          echo "--- Pods ---"
-          kubectl -n "$ns" get pods -l app="${dep}" -o wide || true
-          echo "--- Deploy Events ---"
-          kubectl -n "$ns" describe deploy/"$dep" | sed -n '/Events:/,$p' || true
-          echo "--- One pod describe + logs ---"
-          POD="$(kubectl -n "$ns" get pods -l app="${dep}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-          if [ -n "${POD}" ]; then
-            kubectl -n "$ns" describe pod "${POD}" | sed -n '/Events:/,$p' || true
-            kubectl -n "$ns" logs "${POD}" --tail=200 || true
+          echo "Rollout failed. Undoing to previous revision..."
+          kubectl -n "$ns" rollout undo deploy/"$dep" || true
+
+          echo "--- Diagnostics ---"
+          kubectl -n "$ns" get deploy "$dep" -o wide || true
+          kubectl -n "$ns" get rs -l app="$dep" -o wide || true
+          kubectl -n "$ns" get pods -l app="$dep" -o wide || true
+          kubectl -n "$ns" describe deploy "$dep" | sed -n '/Events:/,$p' || true
+          POD="$(kubectl -n "$ns" get pods -l app="$dep" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+          if [ -n "$POD" ]; then
+            kubectl -n "$ns" describe pod "$POD" | sed -n '/Events:/,$p' || true
+            kubectl -n "$ns" logs "$POD" --tail=200 || true
           fi
           exit 1
-
-      - name: Show services (optional)
-        continue-on-error: true
-        run: kubectl -n "$K8S_NAMESPACE" get svc -o wide || true
