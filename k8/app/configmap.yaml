@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: fighting-characters
+data:
+  DB_NAME: "fighting_characters"
+  COLLECTION_NAME: "characters"
+  SEED_ON_START: "false"
