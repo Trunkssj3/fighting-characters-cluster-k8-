@@ -1,0 +1,21 @@
+architecture: standalone
+
+auth:
+  enabled: true
+  rootUser: root
+  rootPassword: "ChangeMe_Strong_!23"   # change in real env
+  usernames: ["appuser"]
+  passwords: ["AppUser_Str0ng!"]        # change in real env
+  databases: ["fighting_characters"]
+
+primary:
+  persistence:
+    enabled: true
+    storageClass: gp3
+    size: 5Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
