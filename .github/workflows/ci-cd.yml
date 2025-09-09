@@ -1,4 +1,4 @@
-name: CD (k8)
+name: CD 
 
 on:
   repository_dispatch:
@@ -64,58 +64,77 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          TAG=$(aws ecr describe-images                 --repository-name "$ECR_REPOSITORY"                 --region "$AWS_REGION"                 --query "reverse(sort_by(imageDetails,&imagePushedAt))[0].imageTags[0]"                 --output text)
-          [ -z "$TAG" -o "$TAG" = "None" ] && { echo "No tags found" >&2; exit 1; }
+          TAG=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" --region "$AWS_REGION" \
+                --query "reverse(sort_by(imageDetails,&imagePushedAt))[0].imageTags[0]" --output text)
+          [ -z "$TAG" -o "$TAG" = "None" ] && { echo "No tags found in ECR '$ECR_REPOSITORY'"; exit 1; }
           echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
-          echo "Auto-selected $TAG"
+          echo "Using latest image tag: $TAG"
+
+      - name: Install kubectl (stable)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSL -o kubectl https://storage.googleapis.com/kubernetes-release/release/$(curl -sSL https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client=true
 
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
 
-      - name: Apply base manifests (idempotent)
+      - name: Apply manifests with Kustomize (Mongo via Helm + app)
+        shell: bash
         run: |
+          set -euo pipefail
           kubectl get ns "$K8S_NAMESPACE" || kubectl create ns "$K8S_NAMESPACE"
-          kubectl apply -n "$K8S_NAMESPACE" -f k8/
+          kubectl apply -k k8/
 
-      - name: Set image
+      - name: Wait for MongoDB StatefulSet readiness (best-effort)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Bitnami chart (standalone) StatefulSet default name:
+          kubectl -n "$K8S_NAMESPACE" rollout status statefulset/mongo-mongodb --timeout=300s || true
+
+      - name: Set image on Deployment
         env:
           FULL_IMAGE: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
         run: |
           set -euo pipefail
           kubectl -n "$K8S_NAMESPACE" set image deployment/"$DEPLOYMENT_NAME" "$CONTAINER_NAME=$FULL_IMAGE"
 
-      - name: Zero-downtime rollout with safe fallback
+      - name: Zero-downtime rollout with fallback
         shell: bash
         run: |
           set -euo pipefail
           ns="${K8S_NAMESPACE}"
           dep="${DEPLOYMENT_NAME}"
-          # record current replicas
-          orig=$(kubectl -n "$ns" get deploy "$dep" -o jsonpath='{.spec.replicas}')
-          [ -z "$orig" ] && orig=1
 
+          # Record current replicas
+          orig=$(kubectl -n "$ns" get deploy "$dep" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 1)
+          [ -z "$orig" ] && orig=1
           echo "Current replicas: $orig"
-          # Ensure rolling strategy is safe (maxUnavailable=0, maxSurge=1)
+
+          # Ensure safe rolling update params
           kubectl -n "$ns" patch deploy "$dep" -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":0,"maxSurge":1}}}}' --type=merge
 
-          # If single replica, temporarily scale up by +1 to avoid downtime
+          # If single replica, temporarily scale up by +1
           if [ "$orig" -lt 2 ]; then
-            echo "Scaling up temporarily to 2 replicas to avoid downtime..."
+            echo "Scaling up temporarily to 2 replicas."
             kubectl -n "$ns" scale deploy "$dep" --replicas=2
           fi
 
           echo "Waiting for rollout..."
           if kubectl -n "$ns" rollout status deploy/"$dep" --timeout=300s; then
-            echo "Rollout completed ✅"
-            # scale back if we scaled up
+            echo "Rollout completed."
             if [ "$orig" -lt 2 ]; then
-              echo "Scaling back to $orig..."
+              echo "Scaling back to $orig."
               kubectl -n "$ns" scale deploy "$dep" --replicas="$orig"
             fi
             exit 0
           fi
 
-          echo "Rollout failed. Undoing to previous revision..."
+          echo "Rollout failed. Attempting rollback to previous revision."
           kubectl -n "$ns" rollout undo deploy/"$dep" || true
 
           echo "--- Diagnostics ---"
