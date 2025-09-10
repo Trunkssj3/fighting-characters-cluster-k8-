@@ -81,6 +81,17 @@ jobs:
 
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
+      
+      - name: Install kustomize
+        shell: bash
+        run: |
+          set -euo pipefail
+          KUSTOMIZE_VERSION=5.4.1
+          curl -sSL -o kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+          tar -xzf kustomize.tar.gz
+          sudo mv kustomize /usr/local/bin/kustomize
+          kustomize version
+
 
       - name: Apply manifests with Kustomize (Mongo via Helm + app)
         shell: bash
@@ -148,3 +159,4 @@ jobs:
             kubectl -n "$ns" logs "$POD" --tail=200 || true
           fi
           exit 1
+
