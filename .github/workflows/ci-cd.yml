@@ -97,8 +97,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          kubectl get ns "$K8S_NAMESPACE" || kubectl create ns "$K8S_NAMESPACE"
-          kubectl apply -k k8/
+          # Make sure namespace exists (idempotent)
+          kubectl create namespace "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+          # Build with Helm enabled, then apply
+          kustomize build --enable-helm k8/ | kubectl apply -n "$K8S_NAMESPACE" -f -
+
 
       - name: Wait for MongoDB StatefulSet readiness (best-effort)
         shell: bash
@@ -159,4 +162,5 @@ jobs:
             kubectl -n "$ns" logs "$POD" --tail=200 || true
           fi
           exit 1
+
 
