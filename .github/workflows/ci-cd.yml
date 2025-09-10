@@ -108,7 +108,7 @@ jobs:
           ns="${K8S_NAMESPACE}"
           svc="fighting-characters"
 
-          echo "Waiting for LoadBalancer hostname..."
+          echo "Waiting for LoadBalancer external address..."
           host=""; ip=""
           for i in {1..60}; do
             host=$(kubectl -n "$ns" get svc "$svc" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
@@ -121,27 +121,45 @@ jobs:
 
           if [ -z "${host}${ip}" ]; then
             echo "::warning title=LoadBalancer pending::Service $svc has no external address yet"
-            exit 0
-          fi
-
-          port=$(kubectl -n "$ns" get svc "$svc" -o jsonpath='{.spec.ports[0].port}')
-          addr="${host:-$ip}"
-          url="http://${addr}"
-          [ "$port" != "80" ] && url="${url}:${port}"
-
-          echo "APP_URL=${url}" >> "$GITHUB_ENV"
-          echo "App URL: ${url}" | tee -a "$GITHUB_STEP_SUMMARY"
-
-          if command -v curl >/dev/null 2>&1; then
-            echo "Probing ${url}/health ..."
-            curl -fsS "${url}/health" >/dev/null && echo "Health: OK" || echo "::warning::/health probe failed"
+          else
+            port=$(kubectl -n "$ns" get svc "$svc" -o jsonpath='{.spec.ports[0].port}')
+            addr="${host:-$ip}"
+            url="http://${addr}"
+            [ "$port" != "80" ] && url="${url}:${port}"
+            echo "APP_URL=${url}" >> "$GITHUB_ENV"
+            echo "App URL: ${url}" | tee -a "$GITHUB_STEP_SUMMARY"
+            if command -v curl >/dev/null 2>&1; then
+              echo "Probing ${url}/health ..."
+              curl -fsS "${url}/health" >/dev/null && echo "Health: OK" || echo "::warning::/health probe failed"
+            fi
           fi
 
       - name: Wait for MongoDB StatefulSet readiness (best-effort)
         shell: bash
         run: |
           set -euo pipefail
-          kubectl -n "$K8S_NAMESPACE" rollout status statefulset/mongo-mongodb --timeout=300s || true
+          ns="${K8S_NAMESPACE}"
+
+          # Detect Mongo StatefulSet if present (works with Bitnami and similar)
+          name="$(kubectl -n "$ns" get sts -l app.kubernetes.io/name=mongodb \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+
+          # Fallback to common release names
+          if [ -z "$name" ]; then
+            for c in mongo-mongodb mongodb bitnami-mongodb; do
+              if kubectl -n "$ns" get sts "$c" >/dev/null 2>&1; then
+                name="$c"; break
+              fi
+            done
+          fi
+
+          if [ -z "$name" ]; then
+            echo "::notice title=MongoDB::No MongoDB StatefulSet detected; skipping wait"
+            exit 0
+          fi
+
+          echo "Waiting for StatefulSet/${name} to be ready..."
+          kubectl -n "$ns" rollout status statefulset/"$name" --timeout=300s || true
 
       - name: Set image on Deployment
         env:
