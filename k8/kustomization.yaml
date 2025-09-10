@@ -1,18 +1,14 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# All resources below will be created in this namespace
 namespace: fighting-characters
 
-# Pull the application manifests from the app/ directory
-resources:
-  - app/
-
-# Creates StatefulSet + PVC + Service for MongoDB via Helm chart
 helmCharts:
   - name: mongodb
     repo: https://charts.bitnami.com/bitnami
     releaseName: mongo
     namespace: fighting-characters
     valuesFile: mongodb-values.yaml
-    
+
+resources:
+  - app
