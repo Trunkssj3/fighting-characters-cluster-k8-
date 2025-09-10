@@ -30,7 +30,7 @@ spec:
       containers:
         - name: fighting-characters
           image: 372595555088.dkr.ecr.ap-south-1.amazonaws.com/fightingcharacters:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 5000
@@ -55,7 +55,7 @@ spec:
                 exit 1
               fi
               echo "[startup] Using module: $MOD in $(pwd) PYTHONPATH=$PYTHONPATH"
-              exec gunicorn -w 3 -b 0.0.0.0:5000 "$MOD" --timeout 60 --graceful-timeout 30
+              exec python -m gunicorn -w 3 -b 0.0.0.0:5000 "$MOD" --timeout 60 --graceful-timeout 30
           lifecycle:
             preStop:
               exec:
@@ -95,3 +95,4 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+
