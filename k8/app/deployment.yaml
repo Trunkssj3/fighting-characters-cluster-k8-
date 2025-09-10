@@ -28,7 +28,6 @@ spec:
         runAsGroup: 10001
         fsGroup: 10001
 
-      # Writable /tmp for gunicorn worker tmp files
       volumes:
         - name: tmp
           emptyDir: {}
@@ -47,7 +46,6 @@ spec:
             - secretRef:
                 name: app-secrets
 
-          # Ensure gunicorn uses writable /tmp
           env:
             - name: TMPDIR
               value: /tmp
@@ -61,8 +59,6 @@ spec:
             - |
               set -e
               export PYTHONPATH="/app:/app/app:${PYTHONPATH:-}"
-              # ensure /tmp is writable (sticky bit like standard /tmp)
-              mkdir -p /tmp && chmod 1777 /tmp
 
               if [ -f /app/app/app.py ]; then
                 cd /app/app
