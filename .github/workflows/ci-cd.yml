@@ -50,11 +50,9 @@ jobs:
             ECR_REPO_IN="${{ inputs.ecr_repository }}"
             AWS_REGION_IN="${{ inputs.region }}"
           fi
-
           echo "IMAGE_TAG=${IMAGE_TAG_IN}"     >> "$GITHUB_ENV"
           echo "ECR_REPOSITORY=${ECR_REPO_IN}" >> "$GITHUB_ENV"
           echo "AWS_REGION=${AWS_REGION_IN}"   >> "$GITHUB_ENV"
-
           echo "image_tag=${IMAGE_TAG_IN}"       >> "$GITHUB_OUTPUT"
           echo "ecr_repository=${ECR_REPO_IN}"   >> "$GITHUB_OUTPUT"
           echo "aws_region=${AWS_REGION_IN}"     >> "$GITHUB_OUTPUT"
@@ -98,67 +96,23 @@ jobs:
           sudo mv kustomize /usr/local/bin/kustomize
           kustomize version
 
-      - name: Apply manifests with Kustomize (Mongo via Helm + app)
+      - name: Apply manifests with Kustomize (Helm-enabled)
         shell: bash
         run: |
           set -euo pipefail
-          # Ensure namespace exists (idempotent)
           kubectl create namespace "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-          # Build with Helm enabled, then apply to that namespace
           kustomize build --enable-helm k8/ | kubectl apply -n "$K8S_NAMESPACE" -f -
 
-      - name: Wait for Ingress (ALB) or Service (LB) & print URL
+      - name: Check AWS Load Balancer Controller (fail fast)
         shell: bash
         run: |
           set -euo pipefail
-          ns="${K8S_NAMESPACE}"
-          app_label="app=fighting-characters"
-
-          # Try Ingress first (ALB controller)
-          ing_name="$(kubectl -n "$ns" get ing -l "$app_label" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-          if [ -n "$ing_name" ]; then
-            echo "Found Ingress: $ing_name (waiting for ALB...)"
-            host=""
-            for i in {1..60}; do
-              host=$(kubectl -n "$ns" get ing "$ing_name" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
-              [ -n "$host" ] && break || sleep 5
-            done
-            if [ -z "$host" ]; then
-              echo "::warning title=ALB pending::Ingress $ing_name has no external hostname yet"
-            else
-              url="http://${host}"
-              echo "APP_URL=${url}" >> "$GITHUB_ENV"
-              echo "App URL (Ingress): ${url}" | tee -a "$GITHUB_STEP_SUMMARY"
-              if command -v curl >/dev/null 2>&1; then
-                echo "Probing ${url}/health ..."
-                curl -fsS "${url}/health" >/dev/null && echo "Health: OK" || echo "::warning::/health probe failed"
-              fi
-            fi
-          else
-            # Fallback: Service of type LoadBalancer named 'fighting-characters'
-            svc="fighting-characters"
-            echo "No Ingress found with label ${app_label}, checking Service/${svc} ..."
-            host=""; ip=""
-            for i in {1..60}; do
-              host=$(kubectl -n "$ns" get svc "$svc" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
-              ip=$(kubectl -n "$ns" get svc "$svc" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-              [ -n "$host" ] || [ -n "$ip" ] && break || sleep 5
-            done
-            if [ -z "${host}${ip}" ]; then
-              echo "::warning title=LoadBalancer pending::Service $svc has no external address yet"
-            else
-              port=$(kubectl -n "$ns" get svc "$svc" -o jsonpath='{.spec.ports[0].port}')
-              addr="${host:-$ip}"
-              url="http://${addr}"
-              [ "$port" != "80" ] && url="${url}:${port}"
-              echo "APP_URL=${url}" >> "$GITHUB_ENV"
-              echo "App URL (Service): ${url}" | tee -a "$GITHUB_STEP_SUMMARY"
-              if command -v curl >/dev/null 2>&1; then
-                echo "Probing ${url}/health ..."
-                curl -fsS "${url}/health" >/dev/null && echo "Health: OK" || echo "::warning::/health probe failed"
-              fi
-            fi
+          if ! kubectl -n kube-system get deploy aws-load-balancer-controller >/dev/null 2>&1; then
+            echo "::error title=ALB Controller missing::Install the AWS Load Balancer Controller (via Terraform or Helm) before deploying the Ingress."
+            echo "Docs: https://kubernetes-sigs.github.io/aws-load-balancer-controller/latest/"
+            exit 1
           fi
+          kubectl -n kube-system rollout status deploy/aws-load-balancer-controller --timeout=60s
 
       - name: Wait for MongoDB StatefulSet readiness (best-effort)
         shell: bash
@@ -191,21 +145,14 @@ jobs:
           set -euo pipefail
           ns="${K8S_NAMESPACE}"
           dep="${DEPLOYMENT_NAME}"
-
-          # Record current replicas
           orig=$(kubectl -n "$ns" get deploy "$dep" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 1)
           [ -z "$orig" ] && orig=1
           echo "Current replicas: $orig"
-
-          # Ensure safe rolling update params
           kubectl -n "$ns" patch deploy "$dep" -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":0,"maxSurge":1}}}}' --type=merge
-
-          # If single replica, temporarily scale up by +1
           if [ "$orig" -lt 2 ]; then
             echo "Scaling up temporarily to 2 replicas."
             kubectl -n "$ns" scale deploy "$dep" --replicas=2
           fi
-
           echo "Waiting for rollout..."
           if kubectl -n "$ns" rollout status deploy/"$dep" --timeout=300s; then
             echo "Rollout completed."
@@ -215,10 +162,8 @@ jobs:
             fi
             exit 0
           fi
-
           echo "Rollout failed. Attempting rollback to previous revision."
           kubectl -n "$ns" rollout undo deploy/"$dep" || true
-
           echo "--- Diagnostics ---"
           kubectl -n "$ns" get ing -o wide || true
           kubectl -n "$ns" describe ing || true
@@ -233,3 +178,48 @@ jobs:
             kubectl -n "$ns" logs "$POD" --tail=200 || true
           fi
           exit 1
+
+      - name: Wait ≤120s for ALB hostname & print URL (fail if missing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ns="${K8S_NAMESPACE}"
+          ing="fighting-characters"
+
+          # Prefer fixed name; fallback to label if renamed
+          if ! kubectl -n "$ns" get ingress "$ing" >/dev/null 2>&1; then
+            ing="$(kubectl -n "$ns" get ing -l app=fighting-characters -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+          fi
+
+          if [ -z "$ing" ]; then
+            echo "::error title=Ingress missing::No Ingress found for app=fighting-characters"
+            kubectl -n "$ns" get ing || true
+            exit 1
+          fi
+
+          echo "Waiting up to 120s for ALB hostname on Ingress/${ing} ..."
+          host=""
+          for i in {1..24}; do
+            host=$(kubectl -n "$ns" get ingress "$ing" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            [ -n "$host" ] && break
+            sleep 5
+          done
+
+          if [ -z "$host" ]; then
+            echo "::error title=ALB pending::Ingress has no hostname after 120s."
+            echo "--- describe ingress ---"
+            kubectl -n "$ns" describe ingress "$ing" || true
+            echo "--- controller logs (last 200) ---"
+            POD=$(kubectl -n kube-system get pods -l app.kubernetes.io/name=aws-load-balancer-controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+            [ -n "$POD" ] && kubectl -n kube-system logs "$POD" --tail=200 || true
+            exit 1
+          fi
+
+          url="http://${host}"
+          echo "APP_URL=${url}" >> "$GITHUB_ENV"
+          echo "App URL: ${url}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+          if command -v curl >/dev/null 2>&1; then
+            echo "Probing ${url}/health ..."
+            curl -fsS "${url}/health" >/dev/null && echo "Health: OK" || echo "::warning::/health probe failed"
+          fi
