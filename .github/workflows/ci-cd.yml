@@ -1,121 +1,149 @@
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: fighting-characters
-  namespace: fighting-characters
-  labels:
-    app: fighting-characters
-spec:
-  replicas: 1
-  progressDeadlineSeconds: 900
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 0
-      maxSurge: 1
-  selector:
-    matchLabels:
-      app: fighting-characters
-  template:
-    metadata:
-      labels:
-        app: fighting-characters
-    spec:
-      terminationGracePeriodSeconds: 60
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 10001
-        runAsGroup: 10001
-        fsGroup: 10001
+name: CD 
 
-      volumes:
-        - name: tmp
-          emptyDir: {}
+on:
+  repository_dispatch:
+    types: [deploy-app]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (leave empty to auto-pick latest)"
+        required: false
+        default: ""
+      ecr_repository:
+        description: "ECR repository name"
+        required: true
+        default: "fightingcharacters"
+      region:
+        description: "AWS region"
+        required: true
+        default: "ap-south-1"
 
-      containers:
-        - name: fighting-characters
-          image: 372595555088.dkr.ecr.ap-south-1.amazonaws.com/fightingcharacters:latest
-          imagePullPolicy: Always
-          ports:
-            - name: http
-              containerPort: 5000
+permissions:
+  id-token: write
+  contents: read
 
-          envFrom:
-            - configMapRef:
-                name: app-config
-            - secretRef:
-                name: app-secrets
+env:
+  ACCOUNT_ID: "372595555088"
+  CLUSTER_NAME: "fighting-characters-cluster"
+  K8S_NAMESPACE: "fighting-characters"
+  DEPLOYMENT_NAME: "fighting-characters"
+  CONTAINER_NAME: "fighting-characters"
 
-          env:
-            - name: TMPDIR
-              value: /tmp
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-          volumeMounts:
-            - name: tmp
-              mountPath: /tmp
+      - name: Resolve inputs/payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            IMAGE_TAG_IN="${{ github.event.client_payload.image_tag }}"
+            ECR_REPO_IN="${{ github.event.client_payload.ecr_repository }}"
+            AWS_REGION_IN="${{ github.event.client_payload.region }}"
+          else
+            IMAGE_TAG_IN="${{ inputs.image_tag }}"
+            ECR_REPO_IN="${{ inputs.ecr_repository }}"
+            AWS_REGION_IN="${{ inputs.region }}"
+          fi
+          echo "IMAGE_TAG=${IMAGE_TAG_IN}"     >> "$GITHUB_ENV"
+          echo "ECR_REPOSITORY=${ECR_REPO_IN}" >> "$GITHUB_ENV"
+          echo "AWS_REGION=${AWS_REGION_IN}"   >> "$GITHUB_ENV"
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.ACCOUNT_ID }}:role/gh-oidc-eks-deploy
+          aws-region: ${{ env.AWS_REGION }}
 
-          command: ["/bin/sh","-c"]
-          args:
-            - |
-              set -e
-              export PYTHONPATH="/app:/app/app:${PYTHONPATH:-}"
-
-              if [ -f /app/app/app.py ]; then
-                cd /app/app
-                MOD="app:app"
-              elif [ -f /app/app.py ]; then
-                cd /app
-                MOD="app:app"
-              else
-                echo "Cannot find app.py at /app/app/app.py or /app/app.py" >&2
-                exit 1
-              fi
-
-              echo "[startup] Using module: $MOD in $(pwd) PYTHONPATH=$PYTHONPATH"
-              exec python -m gunicorn -w 3 -b 0.0.0.0:5000 "$MOD" --worker-tmp-dir /tmp --timeout 60 --graceful-timeout 30
-
-          lifecycle:
-            preStop:
-              exec:
-                command: ["sh","-c","sleep 5"]
-
-          startupProbe:
-            httpGet:
-              path: /health
-              port: http
-            failureThreshold: 30
-            periodSeconds: 2
-            timeoutSeconds: 2
-
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: http
-            initialDelaySeconds: 15
-            periodSeconds: 5
-            timeoutSeconds: 2
-            failureThreshold: 6
-
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: http
-            initialDelaySeconds: 30
-            periodSeconds: 10
-            timeoutSeconds: 2
-            failureThreshold: 3
-
-          resources:
-            requests:
-              cpu: "200m"
-              memory: "256Mi"
-            limits:
-              cpu: "500m"
-              memory: "512Mi"
-
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
-
+      - name: Auto-pick latest image tag if missing
+        if: env.IMAGE_TAG == ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" --region "$AWS_REGION" \
+                --query "reverse(sort_by(imageDetails,&imagePushedAt))[0].imageTags[0]" --output text)
+          [ -z "$TAG" -o "$TAG" = "None" ] && { echo "No tags found in ECR '$ECR_REPOSITORY'"; exit 1; }
+          echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "Using latest image tag: $TAG"
+      - name: Install kubectl (stable)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSL -o kubectl https://storage.googleapis.com/kubernetes-release/release/$(curl -sSL https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client=true
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
+      
+      - name: Install kustomize
+        shell: bash
+        run: |
+          set -euo pipefail
+          KUSTOMIZE_VERSION=5.4.1
+          curl -sSL -o kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+          tar -xzf kustomize.tar.gz
+          sudo mv kustomize /usr/local/bin/kustomize
+          kustomize version
+      - name: Apply manifests with Kustomize (Mongo via Helm + app)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Make sure namespace exists (idempotent)
+          kubectl create namespace "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+          # Build with Helm enabled, then apply
+          kustomize build --enable-helm k8/ | kubectl apply -n "$K8S_NAMESPACE" -f -
+      - name: Wait for MongoDB StatefulSet readiness (best-effort)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Bitnami chart (standalone) StatefulSet default name:
+          kubectl -n "$K8S_NAMESPACE" rollout status statefulset/mongo-mongodb --timeout=300s || true
+      - name: Set image on Deployment
+        env:
+          FULL_IMAGE: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+        run: |
+          set -euo pipefail
+          kubectl -n "$K8S_NAMESPACE" set image deployment/"$DEPLOYMENT_NAME" "$CONTAINER_NAME=$FULL_IMAGE"
+      - name: Zero-downtime rollout with fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          ns="${K8S_NAMESPACE}"
+          dep="${DEPLOYMENT_NAME}"
+          # Record current replicas
+          orig=$(kubectl -n "$ns" get deploy "$dep" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 1)
+          [ -z "$orig" ] && orig=1
+          echo "Current replicas: $orig"
+          # Ensure safe rolling update params
+          kubectl -n "$ns" patch deploy "$dep" -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":0,"maxSurge":1}}}}' --type=merge
+          # If single replica, temporarily scale up by +1
+          if [ "$orig" -lt 2 ]; then
+            echo "Scaling up temporarily to 2 replicas."
+            kubectl -n "$ns" scale deploy "$dep" --replicas=2
+          fi
+          echo "Waiting for rollout..."
+          if kubectl -n "$ns" rollout status deploy/"$dep" --timeout=300s; then
+            echo "Rollout completed."
+            if [ "$orig" -lt 2 ]; then
+              echo "Scaling back to $orig."
+              kubectl -n "$ns" scale deploy "$dep" --replicas="$orig"
+            fi
+            exit 0
+          fi
+          echo "Rollout failed. Attempting rollback to previous revision."
+          kubectl -n "$ns" rollout undo deploy/"$dep" || true
+          echo "--- Diagnostics ---"
+          kubectl -n "$ns" get deploy "$dep" -o wide || true
+          kubectl -n "$ns" get rs -l app="$dep" -o wide || true
+          kubectl -n "$ns" get pods -l app="$dep" -o wide || true
+          kubectl -n "$ns" describe deploy "$dep" | sed -n '/Events:/,$p' || true
+          POD="$(kubectl -n "$ns" get pods -l app="$dep" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+          if [ -n "$POD" ]; then
+            kubectl -n "$ns" describe pod "$POD" | sed -n '/Events:/,$p' || true
+            kubectl -n "$ns" logs "$POD" --tail=200 || true
+          fi
+          exit 1
