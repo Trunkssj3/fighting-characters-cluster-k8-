@@ -37,6 +37,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Resolve inputs/payload
+        id: resolve
         shell: bash
         run: |
           set -euo pipefail
@@ -49,15 +50,20 @@ jobs:
             ECR_REPO_IN="${{ inputs.ecr_repository }}"
             AWS_REGION_IN="${{ inputs.region }}"
           fi
+
           echo "IMAGE_TAG=${IMAGE_TAG_IN}"     >> "$GITHUB_ENV"
           echo "ECR_REPOSITORY=${ECR_REPO_IN}" >> "$GITHUB_ENV"
           echo "AWS_REGION=${AWS_REGION_IN}"   >> "$GITHUB_ENV"
+
+          echo "image_tag=${IMAGE_TAG_IN}"       >> "$GITHUB_OUTPUT"
+          echo "ecr_repository=${ECR_REPO_IN}"   >> "$GITHUB_OUTPUT"
+          echo "aws_region=${AWS_REGION_IN}"     >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ env.ACCOUNT_ID }}:role/gh-oidc-eks-deploy
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ${{ steps.resolve.outputs.aws_region }}
 
       - name: Auto-pick latest image tag if missing
         if: env.IMAGE_TAG == ''
@@ -101,36 +107,56 @@ jobs:
           # Build with Helm enabled, then apply to that namespace
           kustomize build --enable-helm k8/ | kubectl apply -n "$K8S_NAMESPACE" -f -
 
-      - name: Wait for Service LoadBalancer & print URL
+      - name: Wait for Ingress (ALB) or Service (LB) & print URL
         shell: bash
         run: |
           set -euo pipefail
           ns="${K8S_NAMESPACE}"
-          svc="fighting-characters"
+          app_label="app=fighting-characters"
 
-          echo "Waiting for LoadBalancer external address..."
-          host=""; ip=""
-          for i in {1..60}; do
-            host=$(kubectl -n "$ns" get svc "$svc" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
-            ip=$(kubectl -n "$ns" get svc "$svc" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-            if [ -n "$host" ] || [ -n "$ip" ]; then
-              break
+          # Try Ingress first (ALB controller)
+          ing_name="$(kubectl -n "$ns" get ing -l "$app_label" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+          if [ -n "$ing_name" ]; then
+            echo "Found Ingress: $ing_name (waiting for ALB...)"
+            host=""
+            for i in {1..60}; do
+              host=$(kubectl -n "$ns" get ing "$ing_name" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+              [ -n "$host" ] && break || sleep 5
+            done
+            if [ -z "$host" ]; then
+              echo "::warning title=ALB pending::Ingress $ing_name has no external hostname yet"
+            else
+              url="http://${host}"
+              echo "APP_URL=${url}" >> "$GITHUB_ENV"
+              echo "App URL (Ingress): ${url}" | tee -a "$GITHUB_STEP_SUMMARY"
+              if command -v curl >/dev/null 2>&1; then
+                echo "Probing ${url}/health ..."
+                curl -fsS "${url}/health" >/dev/null && echo "Health: OK" || echo "::warning::/health probe failed"
+              fi
             fi
-            sleep 5
-          done
-
-          if [ -z "${host}${ip}" ]; then
-            echo "::warning title=LoadBalancer pending::Service $svc has no external address yet"
           else
-            port=$(kubectl -n "$ns" get svc "$svc" -o jsonpath='{.spec.ports[0].port}')
-            addr="${host:-$ip}"
-            url="http://${addr}"
-            [ "$port" != "80" ] && url="${url}:${port}"
-            echo "APP_URL=${url}" >> "$GITHUB_ENV"
-            echo "App URL: ${url}" | tee -a "$GITHUB_STEP_SUMMARY"
-            if command -v curl >/dev/null 2>&1; then
-              echo "Probing ${url}/health ..."
-              curl -fsS "${url}/health" >/dev/null && echo "Health: OK" || echo "::warning::/health probe failed"
+            # Fallback: Service of type LoadBalancer named 'fighting-characters'
+            svc="fighting-characters"
+            echo "No Ingress found with label ${app_label}, checking Service/${svc} ..."
+            host=""; ip=""
+            for i in {1..60}; do
+              host=$(kubectl -n "$ns" get svc "$svc" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+              ip=$(kubectl -n "$ns" get svc "$svc" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+              [ -n "$host" ] || [ -n "$ip" ] && break || sleep 5
+            done
+            if [ -z "${host}${ip}" ]; then
+              echo "::warning title=LoadBalancer pending::Service $svc has no external address yet"
+            else
+              port=$(kubectl -n "$ns" get svc "$svc" -o jsonpath='{.spec.ports[0].port}')
+              addr="${host:-$ip}"
+              url="http://${addr}"
+              [ "$port" != "80" ] && url="${url}:${port}"
+              echo "APP_URL=${url}" >> "$GITHUB_ENV"
+              echo "App URL (Service): ${url}" | tee -a "$GITHUB_STEP_SUMMARY"
+              if command -v curl >/dev/null 2>&1; then
+                echo "Probing ${url}/health ..."
+                curl -fsS "${url}/health" >/dev/null && echo "Health: OK" || echo "::warning::/health probe failed"
+              fi
             fi
           fi
 
@@ -139,25 +165,16 @@ jobs:
         run: |
           set -euo pipefail
           ns="${K8S_NAMESPACE}"
-
-          # Detect Mongo StatefulSet if present (works with Bitnami and similar)
-          name="$(kubectl -n "$ns" get sts -l app.kubernetes.io/name=mongodb \
-            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-
-          # Fallback to common release names
+          name="$(kubectl -n "$ns" get sts -l app.kubernetes.io/name=mongodb -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
           if [ -z "$name" ]; then
             for c in mongo-mongodb mongodb bitnami-mongodb; do
-              if kubectl -n "$ns" get sts "$c" >/dev/null 2>&1; then
-                name="$c"; break
-              fi
+              if kubectl -n "$ns" get sts "$c" >/dev/null 2>&1; then name="$c"; break; fi
             done
           fi
-
           if [ -z "$name" ]; then
             echo "::notice title=MongoDB::No MongoDB StatefulSet detected; skipping wait"
             exit 0
           fi
-
           echo "Waiting for StatefulSet/${name} to be ready..."
           kubectl -n "$ns" rollout status statefulset/"$name" --timeout=300s || true
 
@@ -203,6 +220,9 @@ jobs:
           kubectl -n "$ns" rollout undo deploy/"$dep" || true
 
           echo "--- Diagnostics ---"
+          kubectl -n "$ns" get ing -o wide || true
+          kubectl -n "$ns" describe ing || true
+          kubectl -n "$ns" get svc -o wide || true
           kubectl -n "$ns" get deploy "$dep" -o wide || true
           kubectl -n "$ns" get rs -l app="$dep" -o wide || true
           kubectl -n "$ns" get pods -l app="$dep" -o wide || true
