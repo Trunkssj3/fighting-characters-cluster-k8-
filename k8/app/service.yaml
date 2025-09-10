@@ -6,9 +6,10 @@ metadata:
   labels:
     app: fighting-characters
 spec:
+  type: ClusterIP
   selector:
     app: fighting-characters
   ports:
     - name: http
-      port: 5000
+      port: 80
       targetPort: http
