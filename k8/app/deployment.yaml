@@ -27,6 +27,12 @@ spec:
         runAsUser: 10001
         runAsGroup: 10001
         fsGroup: 10001
+
+      # Writable /tmp for gunicorn worker tmp files
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
       containers:
         - name: fighting-characters
           image: 372595555088.dkr.ecr.ap-south-1.amazonaws.com/fightingcharacters:latest
@@ -34,16 +40,30 @@ spec:
           ports:
             - name: http
               containerPort: 5000
+
           envFrom:
             - configMapRef:
                 name: app-config
             - secretRef:
                 name: app-secrets
+
+          # Ensure gunicorn uses writable /tmp
+          env:
+            - name: TMPDIR
+              value: /tmp
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
           command: ["/bin/sh","-c"]
           args:
             - |
               set -e
               export PYTHONPATH="/app:/app/app:${PYTHONPATH:-}"
+              # ensure /tmp is writable (sticky bit like standard /tmp)
+              mkdir -p /tmp && chmod 1777 /tmp
+
               if [ -f /app/app/app.py ]; then
                 cd /app/app
                 MOD="app:app"
@@ -54,12 +74,15 @@ spec:
                 echo "Cannot find app.py at /app/app/app.py or /app/app.py" >&2
                 exit 1
               fi
+
               echo "[startup] Using module: $MOD in $(pwd) PYTHONPATH=$PYTHONPATH"
-              exec python -m gunicorn -w 3 -b 0.0.0.0:5000 "$MOD" --timeout 60 --graceful-timeout 30
+              exec python -m gunicorn -w 3 -b 0.0.0.0:5000 "$MOD" --worker-tmp-dir /tmp --timeout 60 --graceful-timeout 30
+
           lifecycle:
             preStop:
               exec:
                 command: ["sh","-c","sleep 5"]
+
           startupProbe:
             httpGet:
               path: /health
@@ -67,6 +90,7 @@ spec:
             failureThreshold: 30
             periodSeconds: 2
             timeoutSeconds: 2
+
           readinessProbe:
             httpGet:
               path: /health
@@ -75,6 +99,7 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 2
             failureThreshold: 6
+
           livenessProbe:
             httpGet:
               path: /health
@@ -83,6 +108,7 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 3
+
           resources:
             requests:
               cpu: "200m"
@@ -90,9 +116,9 @@ spec:
             limits:
               cpu: "500m"
               memory: "512Mi"
+
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
-
