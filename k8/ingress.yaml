@@ -3,14 +3,14 @@ kind: Ingress
 metadata:
   name: fighting-characters
   namespace: fighting-characters
+  labels:
+    app: fighting-characters   
   annotations:
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
     alb.ingress.kubernetes.io/healthcheck-path: /health
     alb.ingress.kubernetes.io/healthcheck-port: traffic-port
     alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
-    # Optional: group/name lets multiple ingresses share one ALB
-    # alb.ingress.kubernetes.io/group.name: fighting-characters
 spec:
   ingressClassName: alb
   rules:
