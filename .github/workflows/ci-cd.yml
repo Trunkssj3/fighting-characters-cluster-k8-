@@ -1,4 +1,4 @@
-name: CD 
+name: CD
 
 on:
   repository_dispatch:
@@ -52,6 +52,7 @@ jobs:
           echo "IMAGE_TAG=${IMAGE_TAG_IN}"     >> "$GITHUB_ENV"
           echo "ECR_REPOSITORY=${ECR_REPO_IN}" >> "$GITHUB_ENV"
           echo "AWS_REGION=${AWS_REGION_IN}"   >> "$GITHUB_ENV"
+
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -68,6 +69,7 @@ jobs:
           [ -z "$TAG" -o "$TAG" = "None" ] && { echo "No tags found in ECR '$ECR_REPOSITORY'"; exit 1; }
           echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
           echo "Using latest image tag: $TAG"
+
       - name: Install kubectl (stable)
         shell: bash
         run: |
@@ -76,9 +78,10 @@ jobs:
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/kubectl
           kubectl version --client=true
+
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
-      
+
       - name: Install kustomize
         shell: bash
         run: |
@@ -88,43 +91,86 @@ jobs:
           tar -xzf kustomize.tar.gz
           sudo mv kustomize /usr/local/bin/kustomize
           kustomize version
+
       - name: Apply manifests with Kustomize (Mongo via Helm + app)
         shell: bash
         run: |
           set -euo pipefail
-          # Make sure namespace exists (idempotent)
+          # Ensure namespace exists (idempotent)
           kubectl create namespace "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-          # Build with Helm enabled, then apply
+          # Build with Helm enabled, then apply to that namespace
           kustomize build --enable-helm k8/ | kubectl apply -n "$K8S_NAMESPACE" -f -
+
+      - name: Wait for Service LoadBalancer & print URL
+        shell: bash
+        run: |
+          set -euo pipefail
+          ns="${K8S_NAMESPACE}"
+          svc="fighting-characters"
+
+          echo "Waiting for LoadBalancer hostname..."
+          host=""; ip=""
+          for i in {1..60}; do
+            host=$(kubectl -n "$ns" get svc "$svc" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            ip=$(kubectl -n "$ns" get svc "$svc" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+            if [ -n "$host" ] || [ -n "$ip" ]; then
+              break
+            fi
+            sleep 5
+          done
+
+          if [ -z "${host}${ip}" ]; then
+            echo "::warning title=LoadBalancer pending::Service $svc has no external address yet"
+            exit 0
+          fi
+
+          port=$(kubectl -n "$ns" get svc "$svc" -o jsonpath='{.spec.ports[0].port}')
+          addr="${host:-$ip}"
+          url="http://${addr}"
+          [ "$port" != "80" ] && url="${url}:${port}"
+
+          echo "APP_URL=${url}" >> "$GITHUB_ENV"
+          echo "App URL: ${url}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+          if command -v curl >/dev/null 2>&1; then
+            echo "Probing ${url}/health ..."
+            curl -fsS "${url}/health" >/dev/null && echo "Health: OK" || echo "::warning::/health probe failed"
+          fi
+
       - name: Wait for MongoDB StatefulSet readiness (best-effort)
         shell: bash
         run: |
           set -euo pipefail
-          # Bitnami chart (standalone) StatefulSet default name:
           kubectl -n "$K8S_NAMESPACE" rollout status statefulset/mongo-mongodb --timeout=300s || true
+
       - name: Set image on Deployment
         env:
           FULL_IMAGE: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
         run: |
           set -euo pipefail
           kubectl -n "$K8S_NAMESPACE" set image deployment/"$DEPLOYMENT_NAME" "$CONTAINER_NAME=$FULL_IMAGE"
+
       - name: Zero-downtime rollout with fallback
         shell: bash
         run: |
           set -euo pipefail
           ns="${K8S_NAMESPACE}"
           dep="${DEPLOYMENT_NAME}"
+
           # Record current replicas
           orig=$(kubectl -n "$ns" get deploy "$dep" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 1)
           [ -z "$orig" ] && orig=1
           echo "Current replicas: $orig"
+
           # Ensure safe rolling update params
           kubectl -n "$ns" patch deploy "$dep" -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":0,"maxSurge":1}}}}' --type=merge
+
           # If single replica, temporarily scale up by +1
           if [ "$orig" -lt 2 ]; then
             echo "Scaling up temporarily to 2 replicas."
             kubectl -n "$ns" scale deploy "$dep" --replicas=2
           fi
+
           echo "Waiting for rollout..."
           if kubectl -n "$ns" rollout status deploy/"$dep" --timeout=300s; then
             echo "Rollout completed."
@@ -134,8 +180,10 @@ jobs:
             fi
             exit 0
           fi
+
           echo "Rollout failed. Attempting rollback to previous revision."
           kubectl -n "$ns" rollout undo deploy/"$dep" || true
+
           echo "--- Diagnostics ---"
           kubectl -n "$ns" get deploy "$dep" -o wide || true
           kubectl -n "$ns" get rs -l app="$dep" -o wide || true
