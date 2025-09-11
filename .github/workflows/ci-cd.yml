@@ -87,7 +87,7 @@ jobs:
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
 
-      - name: Install kustomize
+      - name: Install kustomize & yq
         shell: bash
         run: |
           set -euo pipefail
@@ -97,22 +97,50 @@ jobs:
           sudo mv kustomize /usr/local/bin/kustomize
           kustomize version
 
-      - name: Apply manifests with Kustomize (Helm-enabled)
-        shell: bash
-        run: |
-          set -euo pipefail
-          kubectl create namespace "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-          kustomize build --enable-helm k8/ | kubectl apply -n "$K8S_NAMESPACE" -f -
+          YQ_VERSION=v4.44.3
+          curl -sSL -o yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+          chmod +x yq
+          sudo mv yq /usr/local/bin/yq
+          yq --version
 
-      - name: Check AWS Load Balancer Controller (fail fast)
+      # ---------- חכה ל-ALB Controller ול-webhook לפני שמיישמים Ingress ----------
+      - name: Check AWS Load Balancer Controller (must be ready)
         shell: bash
         run: |
           set -euo pipefail
           if ! kubectl -n kube-system get deploy aws-load-balancer-controller >/dev/null 2>&1; then
-            echo "::error title=ALB Controller missing::Install the AWS Load Balancer Controller before deploying the Ingress."
+            echo "::error title=ALB Controller missing::Install the AWS Load Balancer Controller (Terraform should have done this)."
             exit 1
           fi
-          kubectl -n kube-system rollout status deploy/aws-load-balancer-controller --timeout=60s
+          kubectl -n kube-system rollout status deploy/aws-load-balancer-controller --timeout=5m
+
+          echo "Waiting for webhook endpoints..."
+          for i in {1..60}; do
+            EPS=$(kubectl -n kube-system get endpoints aws-load-balancer-webhook-service \
+                  -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
+            if [ -n "$EPS" ]; then
+              echo "Webhook endpoints are ready: $EPS"
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "$EPS" ]; then
+            echo "::error title=Webhook not ready::aws-load-balancer-webhook-service has no endpoints."
+            kubectl -n kube-system get svc aws-load-balancer-webhook-service -o wide || true
+            kubectl -n kube-system get pods -l app.kubernetes.io/name=aws-load-balancer-controller -o wide || true
+            exit 1
+          fi
+
+      # ---------- החלת כל המניפסטים חוץ מ-Ingress ----------
+      - name: Apply manifests except Ingress (Kustomize + yq filter)
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl create namespace "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+          # בונים את ה-manifests ומסננים כל kind=Ingress
+          kustomize build --enable-helm k8/ \
+            | yq ea 'select(.kind != "Ingress")' - \
+            | kubectl apply -n "$K8S_NAMESPACE" -f -
 
       - name: Wait for MongoDB StatefulSet readiness (best-effort)
         shell: bash
@@ -178,6 +206,20 @@ jobs:
             kubectl -n "$ns" logs "$POD" --tail=200 || true
           fi
           exit 1
+
+      # ---------- עכשיו מיישמים רק את ה-Ingress ----------
+      - name: Apply only Ingress resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          ns="${K8S_NAMESPACE}"
+          # בונים שוב ומסננים רק kind=Ingress
+          INGS=$(kustomize build --enable-helm k8/ | yq ea 'select(.kind == "Ingress")' -)
+          if [ -z "$INGS" ]; then
+            echo "::notice title=Ingress::No Ingress resources in k8/; skipping"
+            exit 0
+          fi
+          echo "$INGS" | kubectl apply -n "$ns" -f -
 
       - name: Wait ≤120s for ALB hostname & print URL (fail if missing)
         shell: bash
