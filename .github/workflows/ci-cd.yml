@@ -32,6 +32,7 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,9 +54,9 @@ jobs:
           echo "IMAGE_TAG=${IMAGE_TAG_IN}"     >> "$GITHUB_ENV"
           echo "ECR_REPOSITORY=${ECR_REPO_IN}" >> "$GITHUB_ENV"
           echo "AWS_REGION=${AWS_REGION_IN}"   >> "$GITHUB_ENV"
-          echo "image_tag=${IMAGE_TAG_IN}"       >> "$GITHUB_OUTPUT"
-          echo "ecr_repository=${ECR_REPO_IN}"   >> "$GITHUB_OUTPUT"
-          echo "aws_region=${AWS_REGION_IN}"     >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG_IN}"     >> "$GITHUB_OUTPUT"
+          echo "ecr_repository=${ECR_REPO_IN}" >> "$GITHUB_OUTPUT"
+          echo "aws_region=${AWS_REGION_IN}"   >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -108,8 +109,7 @@ jobs:
         run: |
           set -euo pipefail
           if ! kubectl -n kube-system get deploy aws-load-balancer-controller >/dev/null 2>&1; then
-            echo "::error title=ALB Controller missing::Install the AWS Load Balancer Controller (via Terraform or Helm) before deploying the Ingress."
-            echo "Docs: https://kubernetes-sigs.github.io/aws-load-balancer-controller/latest/"
+            echo "::error title=ALB Controller missing::Install the AWS Load Balancer Controller before deploying the Ingress."
             exit 1
           fi
           kubectl -n kube-system rollout status deploy/aws-load-balancer-controller --timeout=60s
@@ -186,11 +186,9 @@ jobs:
           ns="${K8S_NAMESPACE}"
           ing="fighting-characters"
 
-          # Prefer fixed name; fallback to label if renamed
           if ! kubectl -n "$ns" get ingress "$ing" >/dev/null 2>&1; then
             ing="$(kubectl -n "$ns" get ing -l app=fighting-characters -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
           fi
-
           if [ -z "$ing" ]; then
             echo "::error title=Ingress missing::No Ingress found for app=fighting-characters"
             kubectl -n "$ns" get ing || true
@@ -218,7 +216,6 @@ jobs:
           url="http://${host}"
           echo "APP_URL=${url}" >> "$GITHUB_ENV"
           echo "App URL: ${url}" | tee -a "$GITHUB_STEP_SUMMARY"
-
           if command -v curl >/dev/null 2>&1; then
             echo "Probing ${url}/health ..."
             curl -fsS "${url}/health" >/dev/null && echo "Health: OK" || echo "::warning::/health probe failed"
