@@ -103,162 +103,39 @@ jobs:
           sudo mv yq /usr/local/bin/yq
           yq --version
 
-      # ---------- חכה ל-ALB Controller ול-webhook לפני שמיישמים Ingress ----------
-      - name: Check AWS Load Balancer Controller (must be ready)
+      # ---------- הבטחת בריאות ה-ALB Controller (דיאגנוסטיקה + תיקון אוטומטי) ----------
+      - name: Ensure AWS Load Balancer Controller is healthy (auto-heal)
         shell: bash
         run: |
           set -euo pipefail
-          if ! kubectl -n kube-system get deploy aws-load-balancer-controller >/dev/null 2>&1; then
-            echo "::error title=ALB Controller missing::Install the AWS Load Balancer Controller (Terraform should have done this)."
-            exit 1
-          fi
-          kubectl -n kube-system rollout status deploy/aws-load-balancer-controller --timeout=5m
+          ns=kube-system
 
-          echo "Waiting for webhook endpoints..."
-          for i in {1..60}; do
-            EPS=$(kubectl -n kube-system get endpoints aws-load-balancer-webhook-service \
-                  -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
-            if [ -n "$EPS" ]; then
-              echo "Webhook endpoints are ready: $EPS"
-              break
-            fi
-            sleep 5
-          done
-          if [ -z "$EPS" ]; then
-            echo "::error title=Webhook not ready::aws-load-balancer-webhook-service has no endpoints."
-            kubectl -n kube-system get svc aws-load-balancer-webhook-service -o wide || true
-            kubectl -n kube-system get pods -l app.kubernetes.io/name=aws-load-balancer-controller -o wide || true
-            exit 1
-          fi
-
-      # ---------- החלת כל המניפסטים חוץ מ-Ingress ----------
-      - name: Apply manifests except Ingress (Kustomize + yq filter)
-        shell: bash
-        run: |
-          set -euo pipefail
-          kubectl create namespace "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-          # בונים את ה-manifests ומסננים כל kind=Ingress
-          kustomize build --enable-helm k8/ \
-            | yq ea 'select(.kind != "Ingress")' - \
-            | kubectl apply -n "$K8S_NAMESPACE" -f -
-
-      - name: Wait for MongoDB StatefulSet readiness (best-effort)
-        shell: bash
-        run: |
-          set -euo pipefail
-          ns="${K8S_NAMESPACE}"
-          name="$(kubectl -n "$ns" get sts -l app.kubernetes.io/name=mongodb -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-          if [ -z "$name" ]; then
-            for c in mongo-mongodb mongodb bitnami-mongodb; do
-              if kubectl -n "$ns" get sts "$c" >/dev/null 2>&1; then name="$c"; break; fi
+          health_check() {
+            kubectl -n "$ns" rollout status deploy/aws-load-balancer-controller --timeout=5m
+            echo "Waiting for webhook endpoints..."
+            for i in {1..60}; do
+              EPS=$(kubectl -n "$ns" get endpoints aws-load-balancer-webhook-service \
+                    -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
+              [ -n "$EPS" ] && { echo "Webhook endpoints are ready: $EPS"; return 0; }
+              sleep 5
             done
-          fi
-          if [ -z "$name" ]; then
-            echo "::notice title=MongoDB::No MongoDB StatefulSet detected; skipping wait"
-            exit 0
-          fi
-          echo "Waiting for StatefulSet/${name} to be ready..."
-          kubectl -n "$ns" rollout status statefulset/"$name" --timeout=300s || true
+            return 1
+          }
 
-      - name: Set image on Deployment
-        env:
-          FULL_IMAGE: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
-        run: |
-          set -euo pipefail
-          kubectl -n "$K8S_NAMESPACE" set image deployment/"$DEPLOYMENT_NAME" "$CONTAINER_NAME=$FULL_IMAGE"
-
-      - name: Zero-downtime rollout with fallback
-        shell: bash
-        run: |
-          set -euo pipefail
-          ns="${K8S_NAMESPACE}"
-          dep="${DEPLOYMENT_NAME}"
-          orig=$(kubectl -n "$ns" get deploy "$dep" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 1)
-          [ -z "$orig" ] && orig=1
-          echo "Current replicas: $orig"
-          kubectl -n "$ns" patch deploy "$dep" -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":0,"maxSurge":1}}}}' --type=merge
-          if [ "$orig" -lt 2 ]; then
-            echo "Scaling up temporarily to 2 replicas."
-            kubectl -n "$ns" scale deploy "$dep" --replicas=2
-          fi
-          echo "Waiting for rollout..."
-          if kubectl -n "$ns" rollout status deploy/"$dep" --timeout=300s; then
-            echo "Rollout completed."
-            if [ "$orig" -lt 2 ]; then
-              echo "Scaling back to $orig."
-              kubectl -n "$ns" scale deploy "$dep" --replicas="$orig"
+          echo "Checking current state..."
+          if kubectl -n "$ns" get deploy aws-load-balancer-controller >/dev/null 2>&1; then
+            if health_check; then
+              echo "ALB Controller is healthy."
+              exit 0
             fi
-            exit 0
-          fi
-          echo "Rollout failed. Attempting rollback to previous revision."
-          kubectl -n "$ns" rollout undo deploy/"$dep" || true
-          echo "--- Diagnostics ---"
-          kubectl -n "$ns" get ing -o wide || true
-          kubectl -n "$ns" describe ing || true
-          kubectl -n "$ns" get svc -o wide || true
-          kubectl -n "$ns" get deploy "$dep" -o wide || true
-          kubectl -n "$ns" get rs -l app="$dep" -o wide || true
-          kubectl -n "$ns" get pods -l app="$dep" -o wide || true
-          kubectl -n "$ns" describe deploy "$dep" | sed -n '/Events:/,$p' || true
-          POD="$(kubectl -n "$ns" get pods -l app="$dep" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-          if [ -n "$POD" ]; then
-            kubectl -n "$ns" describe pod "$POD" | sed -n '/Events:/,$p' || true
-            kubectl -n "$ns" logs "$POD" --tail=200 || true
-          fi
-          exit 1
-
-      # ---------- עכשיו מיישמים רק את ה-Ingress ----------
-      - name: Apply only Ingress resources
-        shell: bash
-        run: |
-          set -euo pipefail
-          ns="${K8S_NAMESPACE}"
-          # בונים שוב ומסננים רק kind=Ingress
-          INGS=$(kustomize build --enable-helm k8/ | yq ea 'select(.kind == "Ingress")' -)
-          if [ -z "$INGS" ]; then
-            echo "::notice title=Ingress::No Ingress resources in k8/; skipping"
-            exit 0
-          fi
-          echo "$INGS" | kubectl apply -n "$ns" -f -
-
-      - name: Wait ≤120s for ALB hostname & print URL (fail if missing)
-        shell: bash
-        run: |
-          set -euo pipefail
-          ns="${K8S_NAMESPACE}"
-          ing="fighting-characters"
-
-          if ! kubectl -n "$ns" get ingress "$ing" >/dev/null 2>&1; then
-            ing="$(kubectl -n "$ns" get ing -l app=fighting-characters -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-          fi
-          if [ -z "$ing" ]; then
-            echo "::error title=Ingress missing::No Ingress found for app=fighting-characters"
-            kubectl -n "$ns" get ing || true
-            exit 1
           fi
 
-          echo "Waiting up to 120s for ALB hostname on Ingress/${ing} ..."
-          host=""
-          for i in {1..24}; do
-            host=$(kubectl -n "$ns" get ingress "$ing" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
-            [ -n "$host" ] && break
-            sleep 5
-          done
+          echo "Collecting diagnostics..."
+          kubectl -n "$ns" get deploy aws-load-balancer-controller -o wide || true
+          kubectl -n "$ns" get pods -l app.kubernetes.io/name=aws-load-balancer-controller -o wide || true
+          POD=$(kubectl -n "$ns" get pods -l app.kubernetes.io/name=aws-load-balancer-controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          [ -n "$POD" ] && kubectl -n "$ns" describe pod "$POD" | sed -n '/Events:/,$p' || true
+          [ -n "$POD" ] && kubectl -n "$ns" logs "$POD" --tail=200 || true
 
-          if [ -z "$host" ]; then
-            echo "::error title=ALB pending::Ingress has no hostname after 120s."
-            echo "--- describe ingress ---"
-            kubectl -n "$ns" describe ingress "$ing" || true
-            echo "--- controller logs (last 200) ---"
-            POD=$(kubectl -n kube-system get pods -l app.kubernetes.io/name=aws-load-balancer-controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-            [ -n "$POD" ] && kubectl -n kube-system logs "$POD" --tail=200 || true
-            exit 1
-          fi
-
-          url="http://${host}"
-          echo "APP_URL=${url}" >> "$GITHUB_ENV"
-          echo "App URL: ${url}" | tee -a "$GITHUB_STEP_SUMMARY"
-          if command -v curl >/dev/null 2>&1; then
-            echo "Probing ${url}/health ..."
-            curl -fsS "${url}/health" >/dev/null && echo "Health: OK" || echo "::warning::/health probe failed"
-          fi
+          echo "Attempting Helm upgrade/install..."
+          helm repo add eks https://aw
