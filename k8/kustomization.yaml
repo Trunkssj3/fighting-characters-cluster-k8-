@@ -3,13 +3,9 @@ kind: Kustomization
 
 namespace: fighting-characters
 
-helmCharts:
-  - name: mongodb
-    repo: https://charts.bitnami.com/bitnami
-    releaseName: mongo
-    namespace: fighting-characters
-    valuesFile: mongodb-values.yaml
-
 resources:
-  - app
+  - app/configmap.yaml
+  - app/secret.yaml
+  - app/service.yaml
+  - app/deployment.yaml
   - ingress.yaml
