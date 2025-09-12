@@ -94,67 +94,7 @@ jobs:
           echo "AWS_REGION: ${AWS_REGION}"
           echo "CLUSTER_NAME: ${CLUSTER_NAME}"
           aws sts get-caller-identity
-
-      # -------- Ensure this role has EKS access (Access Entries) --------
-      - name: Ensure EKS access entry for deploy role
-        shell: bash
-        env:
-          ROLE_ARN: arn:aws:iam::${{ env.ACCOUNT_ID }}:role/gh-oidc-eks-deploy
-        run: |
-          set -euo pipefail
-          export AWS_PAGER=""
-          echo "Ensuring Access Entry for ${ROLE_ARN} on ${CLUSTER_NAME} (${AWS_REGION})"
-
-          # 1) Check/create access entry
-          HAS_ENTRY=$(aws eks list-access-entries \
-            --cluster-name "${CLUSTER_NAME}" --region "${AWS_REGION}" \
-            --query "length(accessEntries[?principalArn=='${ROLE_ARN}'])" --output text || echo 0)
-
-          if [ "${HAS_ENTRY}" != "1" ]; then
-            set +e
-            aws eks create-access-entry \
-              --cluster-name "${CLUSTER_NAME}" \
-              --principal-arn "${ROLE_ARN}" \
-              --type STANDARD \
-              --region "${AWS_REGION}"
-            RC=$?
-            set -e
-            if [ $RC -ne 0 ]; then
-              echo "::error::Failed to create Access Entry. Ensure your IAM role/user running this workflow is allowed to manage EKS Access Entries, or create it once manually."
-              exit 1
-            fi
-            echo "Created access entry for ${ROLE_ARN}"
-          else
-            echo "Access entry already exists"
-          fi
-
-          # 2) Ensure ClusterAdmin access policy
-          POL="arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
-          HAS_POL=$(aws eks list-associated-access-policies \
-            --cluster-name "${CLUSTER_NAME}" \
-            --principal-arn "${ROLE_ARN}" \
-            --region "${AWS_REGION}" \
-            --query "length(associatedAccessPolicies[?policyArn=='${POL}'])" --output text || echo 0)
-
-          if [ "${HAS_POL}" != "1" ]; then
-            set +e
-            aws eks associate-access-policy \
-              --cluster-name "${CLUSTER_NAME}" \
-              --principal-arn "${ROLE_ARN}" \
-              --policy-arn "${POL}" \
-              --access-scope type=cluster \
-              --region "${AWS_REGION}"
-            RC=$?
-            set -e
-            if [ $RC -ne 0 ]; then
-              echo "::error::Failed to associate ClusterAdmin policy. Grant permission or associate it once manually."
-              exit 1
-            fi
-            echo "Associated ClusterAdmin policy"
-          else
-            echo "ClusterAdmin policy already associated"
-          fi
-
+          
           sleep 5
 
       # -------- Tooling --------
@@ -362,3 +302,4 @@ jobs:
             echo "Probing ${url}/health ..."
             curl -fsS "${url}/health" >/dev/null && echo "Health: OK" || echo "::warning::/health probe failed"
           fi
+
