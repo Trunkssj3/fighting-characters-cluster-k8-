@@ -28,9 +28,9 @@ concurrency:
 
 env:
   ACCOUNT_ID: "372595555088"
-  AWS_REGION: "ap-south-1"              
+  AWS_REGION: "ap-south-1"              # set your real region
   AWS_DEFAULT_REGION: "ap-south-1"
-  CLUSTER_NAME: "fighting-characters-cluster"     
+  CLUSTER_NAME: "benshavit-cluster"     # set your real cluster name
   K8S_NAMESPACE: "fighting-characters"
   DEPLOYMENT_NAME: "fighting-characters"
   CONTAINER_NAME: "fighting-characters"
