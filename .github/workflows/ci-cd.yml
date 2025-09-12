@@ -287,7 +287,7 @@ jobs:
           set -euo pipefail
           ns="${K8S_NAMESPACE}"
           dep="${DEPLOYMENT_NAME}"
-          kubectl -n "$ns' "patch deploy \"$dep\" -p '{\"spec\":{\"strategy\":{\"type\":\"RollingUpdate\",\"rollingUpdate\":{\"maxUnavailable\":0,\"maxSurge\":1}}}}' --type=merge || true
+          kubectl -n "$ns" patch deploy "$dep" -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":0,"maxSurge":1}}}}' --type=merge || true
           kubectl -n "$ns" rollout status deploy/"$dep" --timeout=300s || (kubectl -n "$ns" describe deploy "$dep" | sed -n '/Events:/,$p'; exit 1)
 
       # ---------- Wait for ALB hostname ----------
