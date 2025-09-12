@@ -2,17 +2,8 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: fighting-characters
-  namespace: fighting-characters
-  labels:
-    app: fighting-characters
 spec:
   replicas: 1
-  progressDeadlineSeconds: 900
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 0
-      maxSurge: 1
   selector:
     matchLabels:
       app: fighting-characters
@@ -21,100 +12,29 @@ spec:
       labels:
         app: fighting-characters
     spec:
-      terminationGracePeriodSeconds: 60
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 10001
-        runAsGroup: 10001
-        fsGroup: 10001
-
-      volumes:
-        - name: tmp
-          emptyDir: {}
-
+      initContainers:
+        - name: wait-mongo
+          image: mongo:6.0
+          command: ['sh','-c','until mongosh --host mongo --eval "db.adminCommand({ping:1})" >/dev/null 2>&1; do echo waiting for mongo; sleep 3; done']
       containers:
         - name: fighting-characters
-          image: 372595555088.dkr.ecr.ap-south-1.amazonaws.com/fightingcharacters:latest
-          imagePullPolicy: Always
+          image: <will-be-set-by-CD>   # ה-CD כבר מחליף
           ports:
-            - name: http
-              containerPort: 5000
-
-          envFrom:
-            - configMapRef:
-                name: app-config
-            - secretRef:
-                name: app-secrets
-
+            - containerPort: 5000
           env:
-            - name: TMPDIR
-              value: /tmp
-
-          volumeMounts:
-            - name: tmp
-              mountPath: /tmp
-
-          command: ["/bin/sh","-c"]
-          args:
-            - |
-              set -e
-              export PYTHONPATH="/app:/app/app:${PYTHONPATH:-}"
-
-              if [ -f /app/app/app.py ]; then
-                cd /app/app
-                MOD="app:app"
-              elif [ -f /app/app.py ]; then
-                cd /app
-                MOD="app:app"
-              else
-                echo "Cannot find app.py at /app/app/app.py or /app/app.py" >&2
-                exit 1
-              fi
-
-              echo "[startup] Using module: $MOD in $(pwd) PYTHONPATH=$PYTHONPATH"
-              exec python -m gunicorn -w 3 -b 0.0.0.0:5000 "$MOD" --worker-tmp-dir /tmp --timeout 60 --graceful-timeout 30
-
-          lifecycle:
-            preStop:
-              exec:
-                command: ["sh","-c","sleep 5"]
-
-          startupProbe:
-            httpGet:
-              path: /health
-              port: http
-            failureThreshold: 30
-            periodSeconds: 2
-            timeoutSeconds: 2
-
+            - name: PORT
+              value: "5000"
+            - name: MONGO_URI
+              value: "mongodb://mongo:27017/fightingcharacters"
           readinessProbe:
             httpGet:
-              path: /health
-              port: http
-            initialDelaySeconds: 15
-            periodSeconds: 5
-            timeoutSeconds: 2
-            failureThreshold: 6
-
+              path: /
+              port: 5000
+            initialDelaySeconds: 5
+            periodSeconds: 10
           livenessProbe:
             httpGet:
-              path: /health
-              port: http
-            initialDelaySeconds: 30
-            periodSeconds: 10
-            timeoutSeconds: 2
-            failureThreshold: 3
-
-          resources:
-            requests:
-              cpu: "200m"
-              memory: "256Mi"
-            limits:
-              cpu: "500m"
-              memory: "512Mi"
-
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
+              path: /
+              port: 5000
+            initialDelaySeconds: 20
+            periodSeconds: 20
