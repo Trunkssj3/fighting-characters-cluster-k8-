@@ -4,8 +4,8 @@ kind: Kustomization
 namespace: fighting-characters
 
 resources:
-  - app/configmap.yaml
-  - app/secret.yaml
   - app/service.yaml
-  - app/deployment.yaml
-  - ingress.yaml
+  - app/ingress.yaml
+  - db/mongo-service.yaml
+  - db/mongo-statefulset.yaml
+  - infra/storageclass-gp3.yaml
