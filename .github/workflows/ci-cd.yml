@@ -54,7 +54,6 @@ jobs:
         run: |
           set -euo pipefail
           export AWS_PAGER=""
-
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             IMAGE_TAG_IN="${{ github.event.client_payload.image_tag }}"
             ECR_REPO_IN="${{ github.event.client_payload.ecr_repository }}"
@@ -64,7 +63,6 @@ jobs:
             ECR_REPO_IN="${{ inputs.ecr_repository }}"
             AWS_REGION_IN="${{ inputs.region }}"
           fi
-
           if [ -n "${AWS_REGION_IN}" ]; then
             echo "AWS_REGION=${AWS_REGION_IN}" >> "$GITHUB_ENV"
             echo "AWS_DEFAULT_REGION=${AWS_REGION_IN}" >> "$GITHUB_ENV"
@@ -117,20 +115,15 @@ jobs:
           issuer=$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --query "cluster.identity.oidc.issuer" --output text)
           oidc_url="${issuer#https://}"
           echo "OIDC issuer: $issuer"
-
-          # Check if provider exists
           if aws iam list-open-id-connect-providers --query "OpenIDConnectProviderList[?contains(Arn, '${oidc_url}')]" --output text | grep -q "oidc"; then
             echo "OIDC provider already associated."
             exit 0
           fi
-
-          # Compute thumbprint for OIDC issuer
           host=$(echo "$oidc_url" | cut -d'/' -f1)
           echo -n | openssl s_client -servername "$host" -connect "$host:443" 2>/dev/null | \
             openssl x509 -fingerprint -sha1 -noout | sed 's/.*=//' | tr -d ':' > thumb.txt
           tp=$(cat thumb.txt)
           echo "Thumbprint: $tp"
-
           aws iam create-open-id-connect-provider \
             --url "$issuer" \
             --client-id-list sts.amazonaws.com \
@@ -159,7 +152,6 @@ jobs:
           oidc_url="${issuer#https://}"
           oidc_arn=$(aws iam list-open-id-connect-providers --query "OpenIDConnectProviderList[?contains(Arn, '${oidc_url}')].Arn" --output text)
           echo "OIDC ARN: $oidc_arn"
-
           cat > trust.json <<JSON
           {
             "Version": "2012-10-17",
@@ -178,7 +170,6 @@ jobs:
             ]
           }
           JSON
-
           if ! aws iam get-role --role-name "${ALB_ROLE_NAME}" >/dev/null 2>&1; then
             aws iam create-role --role-name "${ALB_ROLE_NAME}" --assume-role-policy-document file://trust.json >/dev/null
             echo "Created role ${ALB_ROLE_NAME}"
@@ -186,7 +177,6 @@ jobs:
             aws iam update-assume-role-policy --role-name "${ALB_ROLE_NAME}" --policy-document file://trust.json
             echo "Role ${ALB_ROLE_NAME} exists (trust policy updated)"
           fi
-
           policy_arn="arn:aws:iam::${ACCOUNT_ID}:policy/${ALB_POLICY_NAME}"
           if ! aws iam list-attached-role-policies --role-name "${ALB_ROLE_NAME}" --query "AttachedPolicies[?PolicyArn=='${policy_arn}']" --output text | grep -q "${policy_arn}"; then
             aws iam attach-role-policy --role-name "${ALB_ROLE_NAME}" --policy-arn "${policy_arn}"
@@ -194,7 +184,6 @@ jobs:
           else
             echo "Policy already attached"
           fi
-
           echo "CONTROLLER_ROLE_ARN=arn:aws:iam::${ACCOUNT_ID}:role/${ALB_ROLE_NAME}" >> "$GITHUB_ENV"
 
       # ---------- Install/upgrade AWS Load Balancer Controller ----------
@@ -209,14 +198,11 @@ jobs:
           VPC_ID=$(aws ec2 describe-subnets --subnet-ids "$SUB1" --region "${AWS_REGION}" \
                    --query 'Subnets[0].VpcId' --output text)
           [ -z "$VPC_ID" -o "$VPC_ID" = "None" ] && { echo "::error::Cannot resolve VPC"; exit 1; }
-
           kubectl -n "$ns" get sa aws-load-balancer-controller >/dev/null 2>&1 || kubectl -n "$ns" create serviceaccount aws-load-balancer-controller
           kubectl -n "$ns" annotate sa aws-load-balancer-controller \
             eks.amazonaws.com/role-arn="${CONTROLLER_ROLE_ARN}" --overwrite
-
           helm repo add eks https://aws.github.io/eks-charts >/dev/null
           helm repo update >/dev/null
-
           helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
             --namespace "$ns" \
             --set clusterName="${CLUSTER_NAME}" \
@@ -224,9 +210,19 @@ jobs:
             --set vpcId="${VPC_ID}" \
             --set serviceAccount.create=false \
             --set serviceAccount.name=aws-load-balancer-controller
-
           kubectl -n "$ns" rollout status deploy/aws-load-balancer-controller --timeout=180s || \
             echo "::notice::ALB controller not fully ready yet; will continue."
+
+      # ---------- Verify EBS CSI (PVC) ----------
+      - name: Verify EBS CSI addon (warn if missing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if aws eks describe-addon --cluster-name "${CLUSTER_NAME}" --region "${AWS_REGION}" --addon-name aws-ebs-csi-driver >/dev/null 2>&1; then
+            echo "EBS CSI addon is present."
+          else
+            echo "::warning::aws-ebs-csi-driver addon is not installed. PVC provisioning may fail."
+          fi
 
       # ---------- Resolve image tag (ECR) if needed ----------
       - name: Auto-pick latest image tag if missing
@@ -240,7 +236,17 @@ jobs:
           echo "IMAGE_TAG=${TAG}" >> "$GITHUB_ENV"
           echo "Using latest image tag: ${TAG}"
 
-      # ---------- Apply manifests (StorageClass, DB, App) ----------
+      # ---------- Preflight: kustomize file existence ----------
+      - name: Preflight kustomize files
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd k8
+          for f in app/service.yaml app/deployment.yaml app/ingress.yaml db/mongo-service.yaml db/mongo-statefulset.yaml infra/storageclass-gp3.yaml; do
+            [ -f "$f" ] || { echo "::error file=k8/$f::Missing"; exit 1; }
+          done
+
+      # ---------- Apply manifests ----------
       - name: Create namespace
         shell: bash
         run: |
@@ -253,7 +259,7 @@ jobs:
           set -euo pipefail
           kustomize build --enable-helm k8/ | kubectl apply -n "${K8S_NAMESPACE}" -f -
 
-      # ---------- Wait for MongoDB PVC + Pod ----------
+      # ---------- Wait for Mongo PVC + Pod ----------
       - name: Wait for MongoDB PVC bound & pod ready
         shell: bash
         run: |
@@ -266,7 +272,6 @@ jobs:
             sleep 5
           done
           kubectl -n "$ns" get pvc || true
-
           echo "Waiting for Mongo pod ready..."
           kubectl -n "$ns" rollout status statefulset/mongo --timeout=300s || true
           kubectl -n "$ns" get pods -l app=mongo -o wide || true
@@ -289,6 +294,32 @@ jobs:
           kubectl -n "$ns" patch deploy "$dep" -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":0,"maxSurge":1}}}}' --type=merge || true
           kubectl -n "$ns" rollout status deploy/"$dep" --timeout=300s || (kubectl -n "$ns" describe deploy "$dep" | sed -n '/Events:/,$p'; exit 1)
 
+      # ---------- In-cluster smoke tests ----------
+      - name: In-cluster smoke test (service -> pods)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ns="${K8S_NAMESPACE}"
+          kubectl -n "$ns" delete pod curl-test --ignore-not-found
+          kubectl -n "$ns" run curl-test --image=curlimages/curl:8.10.1 --restart=Never -- sleep 3600
+          kubectl -n "$ns" wait --for=condition=Ready pod/curl-test --timeout=120s
+          echo "HTTP / via ClusterIP:"
+          kubectl -n "$ns" exec curl-test -- sh -c 'curl -fsS http://fighting-characters.'"$ns"'.svc.cluster.local/ -o /dev/null && echo OK || (echo FAIL; exit 1)'
+          echo "Optional /health:"
+          kubectl -n "$ns" exec curl-test -- sh -c 'curl -fsS http://fighting-characters.'"$ns"'.svc.cluster.local/health -o /dev/null && echo OK || echo "NO_HEALTH"'
+          kubectl -n "$ns" delete pod curl-test --wait=false || true
+
+      - name: Ping Mongo from within cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+          ns="${K8S_NAMESPACE}"
+          kubectl -n "$ns" delete pod mongo-ping --ignore-not-found
+          kubectl -n "$ns" run mongo-ping --image=mongo:6.0 --restart=Never -- bash -lc 'mongosh --host mongo --eval "db.adminCommand({ping:1})"'
+          kubectl -n "$ns" wait --for=condition=Ready pod/mongo-ping --timeout=120s || true
+          kubectl -n "$ns" logs mongo-ping || true
+          kubectl -n "$ns" delete pod mongo-ping --wait=false || true
+
       # ---------- Wait for ALB hostname (with DNS settle) ----------
       - name: Wait up to 3m for Ingress ALB & print URL (with DNS settle)
         shell: bash
@@ -296,7 +327,6 @@ jobs:
           set -euo pipefail
           ns="${K8S_NAMESPACE}"
           ing="fighting-characters"
-
           echo "Waiting up to 3 minutes for Ingress/${ing} hostname..."
           host=""
           for i in {1..36}; do
@@ -304,7 +334,6 @@ jobs:
             [ -n "${host}" ] && break
             sleep 5
           done
-
           if [ -z "${host}" ]; then
             echo "::error::Ingress has no hostname yet."
             kubectl -n "${ns}" describe ingress "${ing}" || true
@@ -312,7 +341,6 @@ jobs:
             [ -n "$POD" ] && kubectl -n kube-system logs "$POD" --tail=200 || true
             exit 1
           fi
-
           echo "Hostname: ${host}"
           echo "Waiting for DNS to resolve..."
           for i in {1..60}; do
@@ -322,7 +350,6 @@ jobs:
             fi
             sleep 5
           done
-
           echo "App URL: http://${host}" | tee -a "$GITHUB_STEP_SUMMARY"
           if command -v curl >/dev/null 2>&1; then
             echo "Probing http://${host}/ ..."
