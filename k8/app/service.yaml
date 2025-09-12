@@ -5,7 +5,7 @@ metadata:
   labels:
     app: fighting-characters
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app: fighting-characters
   ports:
