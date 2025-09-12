@@ -15,8 +15,6 @@ spec:
         app: fighting-characters
     spec:
       terminationGracePeriodSeconds: 30
-
-      # ממתין למונגו לפני שהאפליקציה עולה
       initContainers:
         - name: wait-mongo
           image: mongo:6.0
@@ -31,44 +29,37 @@ spec:
               done
               echo "Mongo did not become ready in time" >&2
               exit 1
-
       containers:
         - name: fighting-characters
-          image: <will-be-set-by-CD>   # ה-CD עושה set image
+          image: <will-be-set-by-CD>  
           imagePullPolicy: Always
           ports:
             - containerPort: 5000
           env:
             - name: PORT
               value: "5000"
+            - name: DB_NAME
+              value: "fightingcharacters"
             - name: MONGO_URI
               value: "mongodb://mongo:27017/fightingcharacters"
-              # אם יש משתמש/סיסמה, עדכן ל: mongodb://USER:PASS@mongo:27017/fightingcharacters
-          # פרובים: קודם startup, ואז readiness/liveness
+            - name: MONGODB_URI
+              value: "mongodb://mongo:27017/fightingcharacters"
+            - name: MONGO_URL
+              value: "mongodb://mongo:27017/fightingcharacters"
           startupProbe:
-            httpGet:
-              path: /
-              port: 5000
+            httpGet: { path: /health, port: 5000 }
             periodSeconds: 5
-            failureThreshold: 30   # עד ~150s לאפשר לאפליקציה לעלות
+            failureThreshold: 30
           readinessProbe:
-            httpGet:
-              path: /
-              port: 5000
+            httpGet: { path: /health, port: 5000 }
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 6
           livenessProbe:
-            httpGet:
-              path: /
-              port: 5000
+            httpGet: { path: /health, port: 5000 }
             initialDelaySeconds: 30
             periodSeconds: 20
             failureThreshold: 6
           resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 500m
-              memory: 512Mi
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
