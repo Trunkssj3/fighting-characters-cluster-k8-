@@ -24,7 +24,7 @@ permissions:
 
 env:
   ACCOUNT_ID: "372595555088"
-  CLUSTER_NAME: "benshavit-cluster"
+  CLUSTER_NAME: "fighting-characters-cluster"
   K8S_NAMESPACE: "fighting-characters"
   DEPLOYMENT_NAME: "fighting-characters"
   CONTAINER_NAME: "fighting-characters"
@@ -275,4 +275,5 @@ jobs:
             echo "Probing ${url}/health ..."
             curl -fsS "${url}/health" >/dev/null && echo "Health: OK" || echo "::warning::/health probe failed"
           fi
+
 
