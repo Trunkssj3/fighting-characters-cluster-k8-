@@ -1,24 +1,317 @@
-- name: Wait for Service EXTERNAL-IP and print URL
-  shell: bash
-  run: |
-    set -euo pipefail
-    ns="${K8S_NAMESPACE}"
-    svc="fighting-characters"
-    echo "Waiting up to 5 minutes for LoadBalancer on Service/${svc} ..."
-    for i in {1..60}; do
-      host=$(kubectl -n "$ns" get svc "$svc" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
-      ip=$(kubectl -n "$ns" get svc "$svc" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-      url="${host:-$ip}"
-      [ -n "$url" ] && break
-      sleep 5
-    done
-    if [ -z "${url:-}" ]; then
-      echo "::error::Service has no external address after 5m"
-      kubectl -n "$ns" get svc "$svc" -o wide || true
-      exit 1
-    fi
-    echo "App URL: http://${url}" | tee -a "$GITHUB_STEP_SUMMARY"
-    if command -v curl >/dev/null 2>&1; then
-      echo "Probing http://${url}/health ..."
-      curl -fsS "http://${url}/health" >/dev/null && echo "Health OK" || echo "::warning::/health probe failed"
-    fi
+name: CD
+
+on:
+  repository_dispatch:
+    types: [deploy-app]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (leave empty to auto-pick latest)"
+        required: false
+        default: ""
+      ecr_repository:
+        description: "ECR repository name"
+        required: true
+        default: "fightingcharacters"
+      region:
+        description: "AWS region (override default if needed)"
+        required: true
+        default: "ap-south-1"
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+env:
+  ACCOUNT_ID: "372595555088"
+  AWS_REGION: "ap-south-1"
+  AWS_DEFAULT_REGION: "ap-south-1"
+  CLUSTER_NAME: "benshavit-cluster"
+  K8S_NAMESPACE: "fighting-characters"
+  DEPLOYMENT_NAME: "fighting-characters"
+  CONTAINER_NAME: "fighting-characters"
+  ECR_REPOSITORY: "fightingcharacters"
+  # IAM names for ALB controller IRSA
+  ALB_POLICY_NAME: "AWSLoadBalancerControllerIAMPolicy"
+  ALB_ROLE_NAME: "AWSLoadBalancerControllerRole"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve inputs/payload
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          export AWS_PAGER=""
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            IMAGE_TAG_IN="${{ github.event.client_payload.image_tag }}"
+            ECR_REPO_IN="${{ github.event.client_payload.ecr_repository }}"
+            AWS_REGION_IN="${{ github.event.client_payload.region }}"
+          else
+            IMAGE_TAG_IN="${{ inputs.image_tag }}"
+            ECR_REPO_IN="${{ inputs.ecr_repository }}"
+            AWS_REGION_IN="${{ inputs.region }}"
+          fi
+          if [ -n "${AWS_REGION_IN}" ]; then
+            echo "AWS_REGION=${AWS_REGION_IN}" >> "$GITHUB_ENV"
+            echo "AWS_DEFAULT_REGION=${AWS_REGION_IN}" >> "$GITHUB_ENV"
+          fi
+          [ -n "${IMAGE_TAG_IN}" ] && echo "IMAGE_TAG=${IMAGE_TAG_IN}" >> "$GITHUB_ENV"
+          [ -n "${ECR_REPO_IN}" ] && echo "ECR_REPOSITORY=${ECR_REPO_IN}" >> "$GITHUB_ENV"
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.ACCOUNT_ID }}:role/gh-oidc-eks-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Who am I & context
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws sts get-caller-identity
+          echo "Region: $AWS_REGION"
+          echo "Cluster: $CLUSTER_NAME"
+
+      - name: Install kubectl, Helm, kustomize
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSL -o kubectl https://storage.googleapis.com/kubernetes-release/release/$(curl -sSL https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+          curl -sSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          KUSTOMIZE_VERSION=5.4.1
+          curl -sSL -o k.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+          tar -xzf k.tar.gz && sudo mv kustomize /usr/local/bin/kustomize
+          kubectl version --client=true && helm version && kustomize version
+
+      - name: Update kubeconfig & sanity
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" >/dev/null
+          aws eks update-kubeconfig --region "${AWS_REGION}" --name "${CLUSTER_NAME}"
+          kubectl cluster-info
+          kubectl get nodes -o wide || true
+          kubectl get ns || true
+
+      # ---------- IRSA for AWS Load Balancer Controller (idempotent) ----------
+      - name: Ensure EKS OIDC provider exists
+        id: oidc
+        shell: bash
+        run: |
+          set -euo pipefail
+          issuer=$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --query "cluster.identity.oidc.issuer" --output text)
+          oidc_url="${issuer#https://}"
+          echo "OIDC issuer: $issuer"
+
+          # Check if provider exists
+          if aws iam list-open-id-connect-providers --query "OpenIDConnectProviderList[?contains(Arn, '${oidc_url}')]" --output text | grep -q "oidc"; then
+            echo "OIDC provider already associated."
+            exit 0
+          fi
+
+          # Compute thumbprint for OIDC issuer
+          host=$(echo "$oidc_url" | cut -d'/' -f1)
+          echo -n | openssl s_client -servername "$host" -connect "$host:443" 2>/dev/null | \
+            openssl x509 -fingerprint -sha1 -noout | sed 's/.*=//' | tr -d ':' > thumb.txt
+          tp=$(cat thumb.txt)
+          echo "Thumbprint: $tp"
+
+          aws iam create-open-id-connect-provider \
+            --url "$issuer" \
+            --client-id-list sts.amazonaws.com \
+            --thumbprint-list "$tp" >/dev/null
+          echo "Created OIDC provider."
+
+      - name: Ensure IAM policy for ALB controller
+        id: alb_policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          # official policy JSON
+          curl -sSL -o alb-iam-policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
+          if ! aws iam get-policy --policy-arn "arn:aws:iam::${ACCOUNT_ID}:policy/${ALB_POLICY_NAME}" >/dev/null 2>&1; then
+            aws iam create-policy --policy-name "${ALB_POLICY_NAME}" --policy-document file://alb-iam-policy.json >/dev/null
+            echo "Created IAM policy ${ALB_POLICY_NAME}"
+          else
+            echo "IAM policy ${ALB_POLICY_NAME} exists"
+          fi
+
+      - name: Ensure IAM role for ALB controller (IRSA) and attach policy
+        id: alb_role
+        shell: bash
+        run: |
+          set -euo pipefail
+          issuer=$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --query "cluster.identity.oidc.issuer" --output text)
+          oidc_url="${issuer#https://}"
+          oidc_arn=$(aws iam list-open-id-connect-providers --query "OpenIDConnectProviderList[?contains(Arn, '${oidc_url}')].Arn" --output text)
+          echo "OIDC ARN: $oidc_arn"
+
+          cat > trust.json <<JSON
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": { "Federated": "${oidc_arn}" },
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": {
+                    "${oidc_url}:sub": "system:serviceaccount:kube-system:aws-load-balancer-controller",
+                    "${oidc_url}:aud": "sts.amazonaws.com"
+                  }
+                }
+              }
+            ]
+          }
+          JSON
+
+          if ! aws iam get-role --role-name "${ALB_ROLE_NAME}" >/dev/null 2>&1; then
+            aws iam create-role --role-name "${ALB_ROLE_NAME}" --assume-role-policy-document file://trust.json >/dev/null
+            echo "Created role ${ALB_ROLE_NAME}"
+          else
+            # keep trust up-to-date (safe)
+            aws iam update-assume-role-policy --role-name "${ALB_ROLE_NAME}" --policy-document file://trust.json
+            echo "Role ${ALB_ROLE_NAME} exists (trust policy updated)"
+          fi
+
+          policy_arn="arn:aws:iam::${ACCOUNT_ID}:policy/${ALB_POLICY_NAME}"
+          if ! aws iam list-attached-role-policies --role-name "${ALB_ROLE_NAME}" --query "AttachedPolicies[?PolicyArn=='${policy_arn}']" --output text | grep -q "${policy_arn}"; then
+            aws iam attach-role-policy --role-name "${ALB_ROLE_NAME}" --policy-arn "${policy_arn}"
+            echo "Attached policy to role"
+          else
+            echo "Policy already attached"
+          fi
+
+          echo "CONTROLLER_ROLE_ARN=arn:aws:iam::${ACCOUNT_ID}:role/${ALB_ROLE_NAME}" >> "$GITHUB_ENV"
+
+      # ---------- Install/upgrade AWS Load Balancer Controller ----------
+      - name: Install/upgrade ALB Controller (with IRSA)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ns="kube-system"
+          SUB1=$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" \
+                  --query 'cluster.resourcesVpcConfig.subnetIds[0]' --output text)
+          [ -z "$SUB1" -o "$SUB1" = "None" ] && { echo "::error::Cannot read subnets from cluster config"; exit 1; }
+          VPC_ID=$(aws ec2 describe-subnets --subnet-ids "$SUB1" --region "${AWS_REGION}" \
+                   --query 'Subnets[0].VpcId' --output text)
+          [ -z "$VPC_ID" -o "$VPC_ID" = "None" ] && { echo "::error::Cannot resolve VPC"; exit 1; }
+
+          kubectl -n "$ns" get sa aws-load-balancer-controller >/dev/null 2>&1 || kubectl -n "$ns" create serviceaccount aws-load-balancer-controller
+          kubectl -n "$ns" annotate sa aws-load-balancer-controller \
+            eks.amazonaws.com/role-arn="${CONTROLLER_ROLE_ARN}" --overwrite
+
+          helm repo add eks https://aws.github.io/eks-charts >/dev/null
+          helm repo update >/dev/null
+
+          helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+            --namespace "$ns" \
+            --set clusterName="${CLUSTER_NAME}" \
+            --set region="${AWS_REGION}" \
+            --set vpcId="${VPC_ID}" \
+            --set serviceAccount.create=false \
+            --set serviceAccount.name=aws-load-balancer-controller
+
+          # brief wait so webhook becomes reachable (don't block forever)
+          kubectl -n "$ns" rollout status deploy/aws-load-balancer-controller --timeout=180s || \
+            echo "::notice::ALB controller not fully ready yet; will continue."
+
+      # ---------- Resolve image tag (ECR) if needed ----------
+      - name: Auto-pick latest image tag if missing
+        if: env.IMAGE_TAG == ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG=$(aws ecr describe-images --repository-name "${ECR_REPOSITORY}" --region "${AWS_REGION}" \
+                --query "reverse(sort_by(imageDetails,&imagePushedAt))[0].imageTags[0]" --output text)
+          [ -z "${TAG}" -o "${TAG}" = "None" ] && { echo "No tags found in ECR '${ECR_REPOSITORY}'"; exit 1; }
+          echo "IMAGE_TAG=${TAG}" >> "$GITHUB_ENV"
+          echo "Using latest image tag: ${TAG}"
+
+      # ---------- Apply manifests (StorageClass, DB, App) ----------
+      - name: Create namespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl create namespace "${K8S_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Apply all manifests via kustomize
+        shell: bash
+        run: |
+          set -euo pipefail
+          kustomize build --enable-helm k8/ | kubectl apply -n "${K8S_NAMESPACE}" -f -
+
+      # ---------- Wait for MongoDB PVC + Pod ----------
+      - name: Wait for MongoDB PVC bound & pod ready
+        shell: bash
+        run: |
+          set -euo pipefail
+          ns="${K8S_NAMESPACE}"
+          echo "Waiting for PVC to bind..."
+          for i in {1..60}; do
+            phase=$(kubectl -n "$ns" get pvc -o jsonpath='{.items[?(@.metadata.name=="mongo-data-mongo-0")].status.phase}' 2>/dev/null || true)
+            [ "$phase" = "Bound" ] && break
+            sleep 5
+          done
+          kubectl -n "$ns" get pvc || true
+
+          echo "Waiting for Mongo pod ready..."
+          kubectl -n "$ns" rollout status statefulset/mongo --timeout=300s || true
+          kubectl -n "$ns" get pods -l app=mongo -o wide || true
+
+      # ---------- Set image on app Deployment ----------
+      - name: Set image on Deployment
+        env:
+          FULL_IMAGE: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl -n "${K8S_NAMESPACE}" set image deployment/"${DEPLOYMENT_NAME}" "${CONTAINER_NAME}=${FULL_IMAGE}"
+
+      - name: Rollout app (zero downtime)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ns="${K8S_NAMESPACE}"
+          dep="${DEPLOYMENT_NAME}"
+          kubectl -n "$ns' "patch deploy \"$dep\" -p '{\"spec\":{\"strategy\":{\"type\":\"RollingUpdate\",\"rollingUpdate\":{\"maxUnavailable\":0,\"maxSurge\":1}}}}' --type=merge || true
+          kubectl -n "$ns" rollout status deploy/"$dep" --timeout=300s || (kubectl -n "$ns" describe deploy "$dep" | sed -n '/Events:/,$p'; exit 1)
+
+      # ---------- Wait for ALB hostname ----------
+      - name: Wait ≤3m for Ingress ALB & print URL
+        shell: bash
+        run: |
+          set -euo pipefail
+          ns="${K8S_NAMESPACE}"
+          ing="fighting-characters"
+          echo "Waiting up to 3 minutes for Ingress/${ing} hostname..."
+          for i in {1..36}; do
+            host=$(kubectl -n "$ns" get ingress "$ing" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            [ -n "$host" ] && break
+            sleep 5
+          done
+          if [ -z "${host:-}" ]; then
+            echo "::error::Ingress has no hostname yet."
+            kubectl -n "$ns" describe ingress "$ing" || true
+            POD=$(kubectl -n kube-system get pods -l app.kubernetes.io/name=aws-load-balancer-controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+            [ -n "$POD" ] && kubectl -n kube-system logs "$POD" --tail=200 || true
+            exit 1
+          fi
+          echo "App URL: http://${host}" | tee -a "$GITHUB_STEP_SUMMARY"
+          if command -v curl >/dev/null 2>&1; then
+            echo "Probing http://${host}/health ..."
+            curl -fsS "http://${host}/health" >/dev/null && echo "Health OK" || echo "::warning::/health probe failed"
+          fi
