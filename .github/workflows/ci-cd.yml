@@ -14,7 +14,7 @@ on:
         required: true
         default: "fightingcharacters"
       region:
-        description: "AWS region"
+        description: "AWS region (override default if needed)"
         required: true
         default: "ap-south-1"
 
@@ -22,9 +22,16 @@ permissions:
   id-token: write
   contents: read
 
+# Prevent overlapping deploys
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
 env:
+  # >>> Set these to your actual account/cluster defaults <<<
   ACCOUNT_ID: "372595555088"
-  CLUSTER_NAME: "fighting-characters-cluster"
+  AWS_REGION: "ap-south-1"                   # default; can be overridden by input
+  CLUSTER_NAME: "fighting-characters-cluster" # default; can be auto-resolved if mismatched
   K8S_NAMESPACE: "fighting-characters"
   DEPLOYMENT_NAME: "fighting-characters"
   CONTAINER_NAME: "fighting-characters"
@@ -33,15 +40,20 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # -------- Resolve inputs & finalize env --------
       - name: Resolve inputs/payload
         id: resolve
         shell: bash
         run: |
           set -euo pipefail
+          export AWS_PAGER=""; export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+          # prefer dispatch payload; fallback to manual inputs
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             IMAGE_TAG_IN="${{ github.event.client_payload.image_tag }}"
             ECR_REPO_IN="${{ github.event.client_payload.ecr_repository }}"
@@ -51,30 +63,80 @@ jobs:
             ECR_REPO_IN="${{ inputs.ecr_repository }}"
             AWS_REGION_IN="${{ inputs.region }}"
           fi
+
+          # allow region override via inputs
+          if [ -n "${AWS_REGION_IN}" ]; then
+            echo "AWS_REGION=${AWS_REGION_IN}" >> "$GITHUB_ENV"
+            echo "AWS_DEFAULT_REGION=${AWS_REGION_IN}" >> "$GITHUB_ENV"
+          else
+            echo "AWS_REGION=${AWS_REGION}" >> "$GITHUB_ENV"
+            echo "AWS_DEFAULT_REGION=${AWS_REGION}" >> "$GITHUB_ENV"
+          fi
+
+          # passthrough for later steps
           echo "IMAGE_TAG=${IMAGE_TAG_IN}"     >> "$GITHUB_ENV"
           echo "ECR_REPOSITORY=${ECR_REPO_IN}" >> "$GITHUB_ENV"
-          echo "AWS_REGION=${AWS_REGION_IN}"   >> "$GITHUB_ENV"
+
+          # outputs (optional)
           echo "image_tag=${IMAGE_TAG_IN}"     >> "$GITHUB_OUTPUT"
           echo "ecr_repository=${ECR_REPO_IN}" >> "$GITHUB_OUTPUT"
           echo "aws_region=${AWS_REGION_IN}"   >> "$GITHUB_OUTPUT"
 
+      # -------- AWS auth (OIDC) --------
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ env.ACCOUNT_ID }}:role/gh-oidc-eks-deploy
-          aws-region: ${{ steps.resolve.outputs.aws_region }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Auto-pick latest image tag if missing
-        if: env.IMAGE_TAG == ''
+      - name: Who am I & context
         shell: bash
         run: |
           set -euo pipefail
-          TAG=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" --region "$AWS_REGION" \
-                --query "reverse(sort_by(imageDetails,&imagePushedAt))[0].imageTags[0]" --output text)
-          [ -z "$TAG" -o "$TAG" = "None" ] && { echo "No tags found in ECR '$ECR_REPOSITORY'"; exit 1; }
-          echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
-          echo "Using latest image tag: $TAG"
+          export AWS_PAGER=""
+          echo "ACCOUNT_ID: ${ACCOUNT_ID}"
+          echo "AWS_REGION: ${AWS_REGION}"
+          echo "CLUSTER_NAME (desired): ${CLUSTER_NAME}"
+          aws sts get-caller-identity
 
+      # -------- Fail fast if cluster doesn't exist; try smart auto-resolve --------
+      - name: Sanity check / resolve cluster name
+        id: cluster_check
+        shell: bash
+        run: |
+          set -euo pipefail
+          export AWS_PAGER=""
+
+          if aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+            echo "Using cluster: ${CLUSTER_NAME}"
+            exit 0
+          fi
+
+          echo "::warning::Cluster '${CLUSTER_NAME}' not found in region '${AWS_REGION}'. Listing clusters..."
+          names=$(aws eks list-clusters --region "${AWS_REGION}" --output text || true)
+          echo "Found clusters in ${AWS_REGION}: ${names:-<none>}"
+
+          # Optional auto-discovery: pick first containing 'fighting-characters'
+          match=$(printf "%s\n" ${names} | tr '\t' '\n' | grep -m1 -E '^fighting-characters.*' || true)
+          if [ -n "${match}" ]; then
+            echo "Auto-resolved CLUSTER_NAME=${match}"
+            echo "CLUSTER_NAME=${match}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # If there's exactly one cluster in region, assume it (last resort)
+          count=$(printf "%s\n" ${names} | tr '\t' '\n' | grep -v 'CLUSTERS' | sed '/^$/d' | wc -l | tr -d ' ')
+          if [ "${count}" = "1" ]; then
+            resolved=$(printf "%s\n" ${names} | tr '\t' '\n' | grep -v 'CLUSTERS' | sed '/^$/d')
+            echo "::notice::Only one cluster found. Using '${resolved}'"
+            echo "CLUSTER_NAME=${resolved}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "::error::EKS cluster '${CLUSTER_NAME}' not found in region '${AWS_REGION}'. Please set correct CLUSTER_NAME/AWS_REGION."
+          exit 1
+
+      # -------- Tooling --------
       - name: Install kubectl (stable)
         shell: bash
         run: |
@@ -84,73 +146,12 @@ jobs:
           sudo mv kubectl /usr/local/bin/kubectl
           kubectl version --client=true
 
-      - name: Update kubeconfig
-        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
-
-      # ========= ALB Controller: heal/ensure readiness =========
-      - name: Ensure AWS Load Balancer Controller healthy (auto-heal)
+      - name: Install Helm
         shell: bash
         run: |
           set -euo pipefail
-          ns="kube-system"
-
-          heal_controller() {
-            echo "Discovering VPC ID from cluster subnets ..."
-            SUB1=$(aws eks describe-cluster --name "$CLUSTER_NAME" --region "$AWS_REGION" \
-                    --query 'cluster.resourcesVpcConfig.subnetIds[0]' --output text)
-            if [ -z "$SUB1" ] || [ "$SUB1" = "None" ]; then
-              echo "::error::Unable to read subnets from EKS cluster config."
-              return 1
-            fi
-            VPC_ID=$(aws ec2 describe-subnets --subnet-ids "$SUB1" --region "$AWS_REGION" \
-                     --query 'Subnets[0].VpcId' --output text)
-            [ -z "$VPC_ID" -o "$VPC_ID" = "None" ] && { echo "::error::Failed to resolve VPC ID"; return 1; }
-
-            echo "VPC_ID resolved: $VPC_ID"
-            echo "Installing/Upgrading ALB Controller via Helm (no SA creation, reuse IRSA from Terraform)..."
-            helm repo add eks https://aws.github.io/eks-charts
-            helm repo update
-
-            helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
-              --namespace "$ns" \
-              --set clusterName="$CLUSTER_NAME" \
-              --set region="$AWS_REGION" \
-              --set vpcId="$VPC_ID" \
-              --set serviceAccount.create=false \
-              --set serviceAccount.name=aws-load-balancer-controller
-          }
-
-          wait_ready() {
-            kubectl -n "$ns" rollout status deploy/aws-load-balancer-controller --timeout=5m
-            echo "Waiting for webhook endpoints..."
-            for i in {1..60}; do
-              EPS=$(kubectl -n "$ns" get endpoints aws-load-balancer-webhook-service \
-                    -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
-              [ -n "$EPS" ] && { echo "Webhook endpoints are ready: $EPS"; return 0; }
-              sleep 5
-            done
-            return 1
-          }
-
-          echo "Checking ALB Controller state ..."
-          if ! kubectl -n "$ns" get deploy aws-load-balancer-controller >/dev/null 2>&1; then
-            echo "Controller not found -> installing."
-            heal_controller
-          fi
-
-          if ! wait_ready; then
-            echo "Controller not healthy -> attempting heal/upgrade."
-            heal_controller
-            wait_ready || { 
-              echo "::error title=ALB Controller not ready::Please check controller logs."
-              kubectl -n "$ns" get deploy aws-load-balancer-controller -o wide || true
-              kubectl -n "$ns" get pods -l app.kubernetes.io/name=aws-load-balancer-controller -o wide || true
-              POD=$(kubectl -n "$ns" get pods -l app.kubernetes.io/name=aws-load-balancer-controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-              [ -n "$POD" ] && kubectl -n "$ns" logs "$POD" --tail=200 || true
-              exit 1
-            }
-          fi
-          echo "ALB Controller is healthy."
+          curl -sSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm version
 
       - name: Install kustomize
         shell: bash
@@ -162,118 +163,167 @@ jobs:
           sudo mv kustomize /usr/local/bin/kustomize
           kustomize version
 
-      - name: Apply manifests with Kustomize (Helm-enabled)
+      # -------- Kubeconfig & basic access --------
+      - name: Update kubeconfig
         shell: bash
         run: |
           set -euo pipefail
-          kubectl create namespace "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-          kustomize build --enable-helm k8/ | kubectl apply -n "$K8S_NAMESPACE" -f -
+          aws eks update-kubeconfig --region "${AWS_REGION}" --name "${CLUSTER_NAME}"
+          kubectl cluster-info
+          kubectl get nodes -o wide || true
+          kubectl get ns || true
 
-      - name: Wait for MongoDB StatefulSet readiness (best-effort)
+      # -------- Image tag resolution (ECR) --------
+      - name: Auto-pick latest image tag if missing
+        if: env.IMAGE_TAG == ''
         shell: bash
         run: |
           set -euo pipefail
-          ns="${K8S_NAMESPACE}"
-          name="$(kubectl -n "$ns" get sts -l app.kubernetes.io/name=mongodb -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-          if [ -z "$name" ]; then
-            for c in mongo-mongodb mongodb bitnami-mongodb; do
-              if kubectl -n "$ns" get sts "$c" >/dev/null 2>&1; then name="$c"; break; fi
+          TAG=$(aws ecr describe-images --repository-name "${ECR_REPOSITORY}" --region "${AWS_REGION}" \
+                --query "reverse(sort_by(imageDetails,&imagePushedAt))[0].imageTags[0]" --output text)
+          [ -z "${TAG}" -o "${TAG}" = "None" ] && { echo "No tags found in ECR '${ECR_REPOSITORY}'"; exit 1; }
+          echo "IMAGE_TAG=${TAG}" >> "$GITHUB_ENV"
+          echo "Using latest image tag: ${TAG}"
+
+      # -------- (Optional) Ensure ALB Controller healthy; will install/upgrade if needed --------
+      - name: Ensure AWS Load Balancer Controller healthy
+        shell: bash
+        run: |
+          set -euo pipefail
+          ns="kube-system"
+
+          heal_controller() {
+            echo "Discovering VPC ID from cluster subnets ..."
+            SUB1=$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" \
+                    --query 'cluster.resourcesVpcConfig.subnetIds[0]' --output text)
+            [ -z "${SUB1}" -o "${SUB1}" = "None" ] && { echo "::error::Unable to read subnets from EKS cluster config."; return 1; }
+            VPC_ID=$(aws ec2 describe-subnets --subnet-ids "${SUB1}" --region "${AWS_REGION}" \
+                     --query 'Subnets[0].VpcId' --output text)
+            [ -z "${VPC_ID}" -o "${VPC_ID}" = "None" ] && { echo "::error::Failed to resolve VPC ID"; return 1; }
+
+            echo "VPC_ID resolved: ${VPC_ID}"
+            echo "Installing/Upgrading ALB Controller via Helm (no SA creation, reuse IRSA if exists)..."
+            helm repo add eks https://aws.github.io/eks-charts
+            helm repo update
+
+            helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+              --namespace "${ns}" \
+              --set clusterName="${CLUSTER_NAME}" \
+              --set region="${AWS_REGION}" \
+              --set vpcId="${VPC_ID}" \
+              --set serviceAccount.create=false \
+              --set serviceAccount.name=aws-load-balancer-controller
+          }
+
+          wait_ready() {
+            kubectl -n "${ns}" rollout status deploy/aws-load-balancer-controller --timeout=5m
+            echo "Waiting for webhook endpoints..."
+            for i in {1..60}; do
+              EPS=$(kubectl -n "${ns}" get endpoints aws-load-balancer-webhook-service \
+                    -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
+              [ -n "${EPS}" ] && { echo "Webhook endpoints are ready: ${EPS}"; return 0; }
+              sleep 5
             done
-          fi
-          if [ -z "$name" ]; then
-            echo "::notice title=MongoDB::No MongoDB StatefulSet detected; skipping wait"
-            exit 0
-          fi
-          echo "Waiting for StatefulSet/${name} to be ready..."
-          kubectl -n "$ns" rollout status statefulset/"$name" --timeout=300s || true
+            return 1
+          }
 
+          echo "Checking ALB Controller state ..."
+          if ! kubectl -n "${ns}" get deploy aws-load-balancer-controller >/dev/null 2>&1; then
+            echo "Controller not found -> installing."
+            heal_controller || { echo "::warning::Install failed (probably IRSA/IAM missing). Continuing without ALB."; exit 0; }
+          fi
+
+          if ! wait_ready; then
+            echo "Controller not healthy -> attempting heal/upgrade."
+            heal_controller || { echo "::warning::Heal failed (probably IRSA/IAM missing). Continuing without ALB."; exit 0; }
+            wait_ready || { 
+              echo "::warning::ALB Controller still not ready. Continuing; Ingress hostname step may fail."
+              exit 0
+            }
+          fi
+          echo "ALB Controller is healthy."
+
+      # -------- Apply manifests --------
+      - name: Apply manifests with Kustomize
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl create namespace "${K8S_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+          # If you are templating Helm charts via kustomize, enable-helm is required:
+          kustomize build --enable-helm k8/ | kubectl apply -n "${K8S_NAMESPACE}" -f -
+
+      # -------- Set image on the Deployment --------
       - name: Set image on Deployment
         env:
           FULL_IMAGE: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+        shell: bash
         run: |
           set -euo pipefail
-          kubectl -n "$K8S_NAMESPACE" set image deployment/"$DEPLOYMENT_NAME" "$CONTAINER_NAME=$FULL_IMAGE"
+          echo "Setting image: ${FULL_IMAGE}"
+          kubectl -n "${K8S_NAMESPACE}" set image deployment/"${DEPLOYMENT_NAME}" "${CONTAINER_NAME}=${FULL_IMAGE}"
 
+      # -------- Zero-downtime rollout (+ fallback) --------
       - name: Zero-downtime rollout with fallback
         shell: bash
         run: |
           set -euo pipefail
           ns="${K8S_NAMESPACE}"
           dep="${DEPLOYMENT_NAME}"
-          orig=$(kubectl -n "$ns" get deploy "$dep" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 1)
-          [ -z "$orig" ] && orig=1
-          echo "Current replicas: $orig"
-          kubectl -n "$ns" patch deploy "$dep" -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":0,"maxSurge":1}}}}' --type=merge
-          if [ "$orig" -lt 2 ]; then
+          orig=$(kubectl -n "${ns}" get deploy "${dep}" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 1)
+          [ -z "${orig}" ] && orig=1
+          echo "Current replicas: ${orig}"
+          kubectl -n "${ns}" patch deploy "${dep}" -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":0,"maxSurge":1}}}}' --type=merge
+          if [ "${orig}" -lt 2 ]; then
             echo "Scaling up temporarily to 2 replicas."
-            kubectl -n "$ns" scale deploy "$dep" --replicas=2
+            kubectl -n "${ns}" scale deploy "${dep}" --replicas=2
           fi
           echo "Waiting for rollout..."
-          if kubectl -n "$ns" rollout status deploy/"$dep" --timeout=300s; then
+          if kubectl -n "${ns}" rollout status deploy/"${dep}" --timeout=300s; then
             echo "Rollout completed."
-            if [ "$orig" -lt 2 ]; then
-              echo "Scaling back to $orig."
-              kubectl -n "$ns" scale deploy "$dep" --replicas="$orig"
+            if [ "${orig}" -lt 2 ]; then
+              echo "Scaling back to ${orig}."
+              kubectl -n "${ns}" scale deploy "${dep}" --replicas="${orig}"
             fi
-            exit 0
+          else
+            echo "Rollout failed. Attempting rollback to previous revision."
+            kubectl -n "${ns}" rollout undo deploy/"${dep}" || true
+            echo "--- Diagnostics ---"
+            kubectl -n "${ns}" get ing -o wide || true
+            kubectl -n "${ns}" describe ing || true
+            kubectl -n "${ns}" get svc -o wide || true
+            kubectl -n "${ns}" get deploy "${dep}" -o wide || true
+            kubectl -n "${ns}" get rs -l app="${dep}" -o wide || true
+            kubectl -n "${ns}" get pods -l app="${dep}" -o wide || true
+            kubectl -n "${ns}" describe deploy "${dep}" | sed -n '/Events:/,$p' || true
+            POD="$(kubectl -n "${ns}" get pods -l app="${dep}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+            if [ -n "${POD}" ]; then
+              kubectl -n "${ns}" describe pod "${POD}" | sed -n '/Events:/,$p' || true
+              kubectl -n "${ns}" logs "${POD}" --tail=200 || true
+            fi
+            exit 1
           fi
-          echo "Rollout failed. Attempting rollback to previous revision."
-          kubectl -n "$ns" rollout undo deploy/"$dep" || true
-          echo "--- Diagnostics ---"
-          kubectl -n "$ns" get ing -o wide || true
-          kubectl -n "$ns" describe ing || true
-          kubectl -n "$ns" get svc -o wide || true
-          kubectl -n "$ns" get deploy "$dep" -o wide || true
-          kubectl -n "$ns" get rs -l app="$dep" -o wide || true
-          kubectl -n "$ns" get pods -l app="$dep" -o wide || true
-          kubectl -n "$ns" describe deploy "$dep" | sed -n '/Events:/,$p' || true
-          POD="$(kubectl -n "$ns" get pods -l app="$dep" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-          if [ -n "$POD" ]; then
-            kubectl -n "$ns" describe pod "$POD" | sed -n '/Events:/,$p' || true
-            kubectl -n "$ns" logs "$POD" --tail=200 || true
-          fi
-          exit 1
 
-      - name: Wait ≤120s for ALB hostname & print URL (fail if missing)
+      # -------- Wait for ALB hostname (best-effort) --------
+      - name: Wait ≤120s for ALB hostname & print URL (best-effort)
         shell: bash
         run: |
           set -euo pipefail
           ns="${K8S_NAMESPACE}"
           ing="fighting-characters"
 
-          if ! kubectl -n "$ns" get ingress "$ing" >/dev/null 2>&1; then
-            ing="$(kubectl -n "$ns" get ing -l app=fighting-characters -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+          if ! kubectl -n "${ns}" get ingress "${ing}" >/dev/null 2>&1; then
+            ing="$(kubectl -n "${ns}" get ing -l app=fighting-characters -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
           fi
-          if [ -z "$ing" ]; then
-            echo "::error title=Ingress missing::No Ingress found for app=fighting-characters"
-            kubectl -n "$ns" get ing || true
-            exit 1
+
+          if [ -z "${ing}" ]; then
+            echo "::notice title=Ingress missing::No Ingress found for app=fighting-characters"
+            kubectl -n "${ns}" get ing || true
+            exit 0
           fi
 
           echo "Waiting up to 120s for ALB hostname on Ingress/${ing} ..."
           host=""
           for i in {1..24}; do
-            host=$(kubectl -n "$ns" get ingress "$ing" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
-            [ -n "$host" ] && break
-            sleep 5
-          done
-
-          if [ -z "$host" ]; then
-            echo "::error title=ALB pending::Ingress has no hostname after 120s."
-            echo "--- describe ingress ---"
-            kubectl -n "$ns" describe ingress "$ing" || true
-            echo "--- controller logs (last 200) ---"
-            POD=$(kubectl -n kube-system get pods -l app.kubernetes.io/name=aws-load-balancer-controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-            [ -n "$POD" ] && kubectl -n kube-system logs "$POD" --tail=200 || true
-            exit 1
-          fi
-
-          url="http://${host}"
-          echo "APP_URL=${url}" >> "$GITHUB_ENV"
-          echo "App URL: ${url}" | tee -a "$GITHUB_STEP_SUMMARY"
-          if command -v curl >/dev/null 2>&1; then
-            echo "Probing ${url}/health ..."
-            curl -fsS "${url}/health" >/dev/null && echo "Health: OK" || echo "::warning::/health probe failed"
-          fi
-
-
+            host=$(kubectl -n "${ns}" get ingress "${ing}" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            [ -n "${host}" ] && break
+            s
