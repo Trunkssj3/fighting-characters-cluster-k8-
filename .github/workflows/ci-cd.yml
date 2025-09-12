@@ -22,19 +22,19 @@ permissions:
   id-token: write
   contents: read
 
-# Prevent overlapping deploys
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
   cancel-in-progress: true
 
 env:
-  # >>> Set these to your actual account/cluster defaults <<<
   ACCOUNT_ID: "372595555088"
-  AWS_REGION: "ap-south-1"                   # default; can be overridden by input
-  CLUSTER_NAME: "fighting-characters-cluster" # default; can be auto-resolved if mismatched
+  AWS_REGION: "ap-south-1"              
+  AWS_DEFAULT_REGION: "ap-south-1"
+  CLUSTER_NAME: "fighting-characters-cluster"     
   K8S_NAMESPACE: "fighting-characters"
   DEPLOYMENT_NAME: "fighting-characters"
   CONTAINER_NAME: "fighting-characters"
+  ECR_REPOSITORY: "fightingcharacters"
 
 jobs:
   deploy:
@@ -45,15 +45,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # -------- Resolve inputs & finalize env --------
+      # -------- Resolve inputs/payload --------
       - name: Resolve inputs/payload
         id: resolve
         shell: bash
         run: |
           set -euo pipefail
-          export AWS_PAGER=""; export AWS_DEFAULT_REGION="${AWS_REGION}"
+          export AWS_PAGER=""
 
-          # prefer dispatch payload; fallback to manual inputs
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             IMAGE_TAG_IN="${{ github.event.client_payload.image_tag }}"
             ECR_REPO_IN="${{ github.event.client_payload.ecr_repository }}"
@@ -64,20 +63,17 @@ jobs:
             AWS_REGION_IN="${{ inputs.region }}"
           fi
 
-          # allow region override via inputs
           if [ -n "${AWS_REGION_IN}" ]; then
-            echo "AWS_REGION=${AWS_REGION_IN}" >> "$GITHUB_ENV"
+            echo "AWS_REGION=${AWS_REGION_IN}"       >> "$GITHUB_ENV"
             echo "AWS_DEFAULT_REGION=${AWS_REGION_IN}" >> "$GITHUB_ENV"
-          else
-            echo "AWS_REGION=${AWS_REGION}" >> "$GITHUB_ENV"
-            echo "AWS_DEFAULT_REGION=${AWS_REGION}" >> "$GITHUB_ENV"
+          fi
+          if [ -n "${IMAGE_TAG_IN}" ]; then
+            echo "IMAGE_TAG=${IMAGE_TAG_IN}" >> "$GITHUB_ENV"
+          fi
+          if [ -n "${ECR_REPO_IN}" ]; then
+            echo "ECR_REPOSITORY=${ECR_REPO_IN}" >> "$GITHUB_ENV"
           fi
 
-          # passthrough for later steps
-          echo "IMAGE_TAG=${IMAGE_TAG_IN}"     >> "$GITHUB_ENV"
-          echo "ECR_REPOSITORY=${ECR_REPO_IN}" >> "$GITHUB_ENV"
-
-          # outputs (optional)
           echo "image_tag=${IMAGE_TAG_IN}"     >> "$GITHUB_OUTPUT"
           echo "ecr_repository=${ECR_REPO_IN}" >> "$GITHUB_OUTPUT"
           echo "aws_region=${AWS_REGION_IN}"   >> "$GITHUB_OUTPUT"
@@ -96,45 +92,70 @@ jobs:
           export AWS_PAGER=""
           echo "ACCOUNT_ID: ${ACCOUNT_ID}"
           echo "AWS_REGION: ${AWS_REGION}"
-          echo "CLUSTER_NAME (desired): ${CLUSTER_NAME}"
+          echo "CLUSTER_NAME: ${CLUSTER_NAME}"
           aws sts get-caller-identity
 
-      # -------- Fail fast if cluster doesn't exist; try smart auto-resolve --------
-      - name: Sanity check / resolve cluster name
-        id: cluster_check
+      # -------- Ensure this role has EKS access (Access Entries) --------
+      - name: Ensure EKS access entry for deploy role
         shell: bash
+        env:
+          ROLE_ARN: arn:aws:iam::${{ env.ACCOUNT_ID }}:role/gh-oidc-eks-deploy
         run: |
           set -euo pipefail
           export AWS_PAGER=""
+          echo "Ensuring Access Entry for ${ROLE_ARN} on ${CLUSTER_NAME} (${AWS_REGION})"
 
-          if aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1; then
-            echo "Using cluster: ${CLUSTER_NAME}"
-            exit 0
+          # 1) Check/create access entry
+          HAS_ENTRY=$(aws eks list-access-entries \
+            --cluster-name "${CLUSTER_NAME}" --region "${AWS_REGION}" \
+            --query "length(accessEntries[?principalArn=='${ROLE_ARN}'])" --output text || echo 0)
+
+          if [ "${HAS_ENTRY}" != "1" ]; then
+            set +e
+            aws eks create-access-entry \
+              --cluster-name "${CLUSTER_NAME}" \
+              --principal-arn "${ROLE_ARN}" \
+              --type STANDARD \
+              --region "${AWS_REGION}"
+            RC=$?
+            set -e
+            if [ $RC -ne 0 ]; then
+              echo "::error::Failed to create Access Entry. Ensure your IAM role/user running this workflow is allowed to manage EKS Access Entries, or create it once manually."
+              exit 1
+            fi
+            echo "Created access entry for ${ROLE_ARN}"
+          else
+            echo "Access entry already exists"
           fi
 
-          echo "::warning::Cluster '${CLUSTER_NAME}' not found in region '${AWS_REGION}'. Listing clusters..."
-          names=$(aws eks list-clusters --region "${AWS_REGION}" --output text || true)
-          echo "Found clusters in ${AWS_REGION}: ${names:-<none>}"
+          # 2) Ensure ClusterAdmin access policy
+          POL="arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+          HAS_POL=$(aws eks list-associated-access-policies \
+            --cluster-name "${CLUSTER_NAME}" \
+            --principal-arn "${ROLE_ARN}" \
+            --region "${AWS_REGION}" \
+            --query "length(associatedAccessPolicies[?policyArn=='${POL}'])" --output text || echo 0)
 
-          # Optional auto-discovery: pick first containing 'fighting-characters'
-          match=$(printf "%s\n" ${names} | tr '\t' '\n' | grep -m1 -E '^fighting-characters.*' || true)
-          if [ -n "${match}" ]; then
-            echo "Auto-resolved CLUSTER_NAME=${match}"
-            echo "CLUSTER_NAME=${match}" >> "$GITHUB_ENV"
-            exit 0
+          if [ "${HAS_POL}" != "1" ]; then
+            set +e
+            aws eks associate-access-policy \
+              --cluster-name "${CLUSTER_NAME}" \
+              --principal-arn "${ROLE_ARN}" \
+              --policy-arn "${POL}" \
+              --access-scope type=cluster \
+              --region "${AWS_REGION}"
+            RC=$?
+            set -e
+            if [ $RC -ne 0 ]; then
+              echo "::error::Failed to associate ClusterAdmin policy. Grant permission or associate it once manually."
+              exit 1
+            fi
+            echo "Associated ClusterAdmin policy"
+          else
+            echo "ClusterAdmin policy already associated"
           fi
 
-          # If there's exactly one cluster in region, assume it (last resort)
-          count=$(printf "%s\n" ${names} | tr '\t' '\n' | grep -v 'CLUSTERS' | sed '/^$/d' | wc -l | tr -d ' ')
-          if [ "${count}" = "1" ]; then
-            resolved=$(printf "%s\n" ${names} | tr '\t' '\n' | grep -v 'CLUSTERS' | sed '/^$/d')
-            echo "::notice::Only one cluster found. Using '${resolved}'"
-            echo "CLUSTER_NAME=${resolved}" >> "$GITHUB_ENV"
-            exit 0
-          fi
-
-          echo "::error::EKS cluster '${CLUSTER_NAME}' not found in region '${AWS_REGION}'. Please set correct CLUSTER_NAME/AWS_REGION."
-          exit 1
+          sleep 5
 
       # -------- Tooling --------
       - name: Install kubectl (stable)
@@ -164,16 +185,18 @@ jobs:
           kustomize version
 
       # -------- Kubeconfig & basic access --------
-      - name: Update kubeconfig
+      - name: Update kubeconfig & sanity
         shell: bash
         run: |
           set -euo pipefail
+          export AWS_PAGER=""
+          aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" >/dev/null
           aws eks update-kubeconfig --region "${AWS_REGION}" --name "${CLUSTER_NAME}"
           kubectl cluster-info
           kubectl get nodes -o wide || true
           kubectl get ns || true
 
-      # -------- Image tag resolution (ECR) --------
+      # -------- Resolve image tag from ECR if empty --------
       - name: Auto-pick latest image tag if missing
         if: env.IMAGE_TAG == ''
         shell: bash
@@ -185,7 +208,7 @@ jobs:
           echo "IMAGE_TAG=${TAG}" >> "$GITHUB_ENV"
           echo "Using latest image tag: ${TAG}"
 
-      # -------- (Optional) Ensure ALB Controller healthy; will install/upgrade if needed --------
+      # -------- Ensure AWS Load Balancer Controller (best-effort) --------
       - name: Ensure AWS Load Balancer Controller healthy
         shell: bash
         run: |
@@ -196,13 +219,13 @@ jobs:
             echo "Discovering VPC ID from cluster subnets ..."
             SUB1=$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" \
                     --query 'cluster.resourcesVpcConfig.subnetIds[0]' --output text)
-            [ -z "${SUB1}" -o "${SUB1}" = "None" ] && { echo "::error::Unable to read subnets from EKS cluster config."; return 1; }
+            [ -z "${SUB1}" -o "${SUB1}" = "None" ] && { echo "::warning::Unable to read subnets from EKS cluster config."; return 0; }
             VPC_ID=$(aws ec2 describe-subnets --subnet-ids "${SUB1}" --region "${AWS_REGION}" \
                      --query 'Subnets[0].VpcId' --output text)
-            [ -z "${VPC_ID}" -o "${VPC_ID}" = "None" ] && { echo "::error::Failed to resolve VPC ID"; return 1; }
+            [ -z "${VPC_ID}" -o "${VPC_ID}" = "None" ] && { echo "::warning::Failed to resolve VPC ID"; return 0; }
 
             echo "VPC_ID resolved: ${VPC_ID}"
-            echo "Installing/Upgrading ALB Controller via Helm (no SA creation, reuse IRSA if exists)..."
+            echo "Installing/Upgrading ALB Controller via Helm (reuse IRSA if exists)..."
             helm repo add eks https://aws.github.io/eks-charts
             helm repo update
 
@@ -230,18 +253,14 @@ jobs:
           echo "Checking ALB Controller state ..."
           if ! kubectl -n "${ns}" get deploy aws-load-balancer-controller >/dev/null 2>&1; then
             echo "Controller not found -> installing."
-            heal_controller || { echo "::warning::Install failed (probably IRSA/IAM missing). Continuing without ALB."; exit 0; }
+            heal_controller || true
           fi
 
           if ! wait_ready; then
-            echo "Controller not healthy -> attempting heal/upgrade."
-            heal_controller || { echo "::warning::Heal failed (probably IRSA/IAM missing). Continuing without ALB."; exit 0; }
-            wait_ready || { 
-              echo "::warning::ALB Controller still not ready. Continuing; Ingress hostname step may fail."
-              exit 0
-            }
+            echo "::notice::ALB Controller not ready yet; continuing. Ingress hostname step may be pending."
+          else
+            echo "ALB Controller is healthy."
           fi
-          echo "ALB Controller is healthy."
 
       # -------- Apply manifests --------
       - name: Apply manifests with Kustomize
@@ -249,10 +268,9 @@ jobs:
         run: |
           set -euo pipefail
           kubectl create namespace "${K8S_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
-          # If you are templating Helm charts via kustomize, enable-helm is required:
           kustomize build --enable-helm k8/ | kubectl apply -n "${K8S_NAMESPACE}" -f -
 
-      # -------- Set image on the Deployment --------
+      # -------- Set image on Deployment --------
       - name: Set image on Deployment
         env:
           FULL_IMAGE: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
@@ -326,4 +344,21 @@ jobs:
           for i in {1..24}; do
             host=$(kubectl -n "${ns}" get ingress "${ing}" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
             [ -n "${host}" ] && break
-            s
+            sleep 5
+          done
+
+          if [ -z "${host}" ]; then
+            echo "::notice title=ALB pending::Ingress has no hostname after 120s."
+            kubectl -n "${ns}" describe ingress "${ing}" || true
+            POD=$(kubectl -n kube-system get pods -l app.kubernetes.io/name=aws-load-balancer-controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+            [ -n "${POD}" ] && kubectl -n kube-system logs "${POD}" --tail=200 || true
+            exit 0
+          fi
+
+          url="http://${host}"
+          echo "APP_URL=${url}" >> "$GITHUB_ENV"
+          echo "App URL: ${url}" | tee -a "$GITHUB_STEP_SUMMARY"
+          if command -v curl >/dev/null 2>&1; then
+            echo "Probing ${url}/health ..."
+            curl -fsS "${url}/health" >/dev/null && echo "Health: OK" || echo "::warning::/health probe failed"
+          fi
