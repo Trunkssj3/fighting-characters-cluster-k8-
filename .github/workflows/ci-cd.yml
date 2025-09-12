@@ -54,6 +54,7 @@ jobs:
         run: |
           set -euo pipefail
           export AWS_PAGER=""
+
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             IMAGE_TAG_IN="${{ github.event.client_payload.image_tag }}"
             ECR_REPO_IN="${{ github.event.client_payload.ecr_repository }}"
@@ -63,6 +64,7 @@ jobs:
             ECR_REPO_IN="${{ inputs.ecr_repository }}"
             AWS_REGION_IN="${{ inputs.region }}"
           fi
+
           if [ -n "${AWS_REGION_IN}" ]; then
             echo "AWS_REGION=${AWS_REGION_IN}" >> "$GITHUB_ENV"
             echo "AWS_DEFAULT_REGION=${AWS_REGION_IN}" >> "$GITHUB_ENV"
@@ -140,7 +142,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # official policy JSON
           curl -sSL -o alb-iam-policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
           if ! aws iam get-policy --policy-arn "arn:aws:iam::${ACCOUNT_ID}:policy/${ALB_POLICY_NAME}" >/dev/null 2>&1; then
             aws iam create-policy --policy-name "${ALB_POLICY_NAME}" --policy-document file://alb-iam-policy.json >/dev/null
@@ -182,7 +183,6 @@ jobs:
             aws iam create-role --role-name "${ALB_ROLE_NAME}" --assume-role-policy-document file://trust.json >/dev/null
             echo "Created role ${ALB_ROLE_NAME}"
           else
-            # keep trust up-to-date (safe)
             aws iam update-assume-role-policy --role-name "${ALB_ROLE_NAME}" --policy-document file://trust.json
             echo "Role ${ALB_ROLE_NAME} exists (trust policy updated)"
           fi
@@ -225,7 +225,6 @@ jobs:
             --set serviceAccount.create=false \
             --set serviceAccount.name=aws-load-balancer-controller
 
-          # brief wait so webhook becomes reachable (don't block forever)
           kubectl -n "$ns" rollout status deploy/aws-load-balancer-controller --timeout=180s || \
             echo "::notice::ALB controller not fully ready yet; will continue."
 
@@ -263,7 +262,7 @@ jobs:
           echo "Waiting for PVC to bind..."
           for i in {1..60}; do
             phase=$(kubectl -n "$ns" get pvc -o jsonpath='{.items[?(@.metadata.name=="mongo-data-mongo-0")].status.phase}' 2>/dev/null || true)
-            [ "$phase" = "Bound" ] && break
+            [ "${phase:-}" = "Bound" ] && break
             sleep 5
           done
           kubectl -n "$ns" get pvc || true
@@ -290,29 +289,42 @@ jobs:
           kubectl -n "$ns" patch deploy "$dep" -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":0,"maxSurge":1}}}}' --type=merge || true
           kubectl -n "$ns" rollout status deploy/"$dep" --timeout=300s || (kubectl -n "$ns" describe deploy "$dep" | sed -n '/Events:/,$p'; exit 1)
 
-      # ---------- Wait for ALB hostname ----------
-      - name: Wait ≤3m for Ingress ALB & print URL
+      # ---------- Wait for ALB hostname (with DNS settle) ----------
+      - name: Wait up to 3m for Ingress ALB & print URL (with DNS settle)
         shell: bash
         run: |
           set -euo pipefail
           ns="${K8S_NAMESPACE}"
           ing="fighting-characters"
+
           echo "Waiting up to 3 minutes for Ingress/${ing} hostname..."
+          host=""
           for i in {1..36}; do
-            host=$(kubectl -n "$ns" get ingress "$ing" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
-            [ -n "$host" ] && break
+            host=$(kubectl -n "${ns}" get ingress "${ing}" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            [ -n "${host}" ] && break
             sleep 5
           done
-          if [ -z "${host:-}" ]; then
+
+          if [ -z "${host}" ]; then
             echo "::error::Ingress has no hostname yet."
-            kubectl -n "$ns" describe ingress "$ing" || true
+            kubectl -n "${ns}" describe ingress "${ing}" || true
             POD=$(kubectl -n kube-system get pods -l app.kubernetes.io/name=aws-load-balancer-controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
             [ -n "$POD" ] && kubectl -n kube-system logs "$POD" --tail=200 || true
             exit 1
           fi
+
+          echo "Hostname: ${host}"
+          echo "Waiting for DNS to resolve..."
+          for i in {1..60}; do
+            if getent ahosts "${host}" >/dev/null 2>&1; then
+              echo "DNS resolved."
+              break
+            fi
+            sleep 5
+          done
+
           echo "App URL: http://${host}" | tee -a "$GITHUB_STEP_SUMMARY"
           if command -v curl >/dev/null 2>&1; then
-            echo "Probing http://${host}/health ..."
-            curl -fsS "http://${host}/health" >/dev/null && echo "Health OK" || echo "::warning::/health probe failed"
+            echo "Probing http://${host}/ ..."
+            curl -fsS "http://${host}/" >/dev/null && echo "HTTP OK" || echo "::warning::HTTP probe failed"
           fi
-
