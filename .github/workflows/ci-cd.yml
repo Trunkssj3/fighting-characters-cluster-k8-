@@ -315,3 +315,4 @@ jobs:
             echo "Probing http://${host}/health ..."
             curl -fsS "http://${host}/health" >/dev/null && echo "Health OK" || echo "::warning::/health probe failed"
           fi
+
