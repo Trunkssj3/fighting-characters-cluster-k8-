@@ -6,37 +6,40 @@
 This repository provides Kubernetes manifests and a Kustomize setup to deploy the Fighting Characters project on EKS.
 
 Key components:
-- **MongoDB** provisioned via **Bitnami Helm chart** (StatefulSet + PVC)
+- **MongoDB**: StatefulSet with a **PersistentVolumeClaim** (EBS `gp3` via EBS CSI))
 - **Flask App Deployment** (Gunicorn-based container from AWS ECR)
-- **Service** (ClusterIP for app, internal Service for MongoDB)
-- **Ingress** (via Nginx Ingress Controller)
+- **Service**: ClusterIP (`port: 80` → `targetPort: 5000`)
+- **Ingress (ALB)**: `ingressClassName: alb` with health check **`/health`**
 - **ConfigMaps / Secrets** managed through Kustomize and GitHub Actions CD
 
 ## Architecture
 ![K8s Architecture](Diagram.png)
 
-- Namespace: `fighting-characters`
 - MongoDB (Helm chart → StatefulSet with PersistentVolumeClaims)
-- Flask App Deployment (ECR container with Gunicorn)
+- App Deployment (Flask + Gunicorn)
 - Service for app (ClusterIP / LoadBalancer depending on ingress)
-- Ingress via Nginx Ingress Controller
+- Ingress via AWS Load Balancer Controller (ALB), internet-facing
 
 ## Repository Structure
 
 ```
 k8/
-├── kustomization.yaml        # root: pulls Helm (Mongo) + app/
-├── mongodb-values.yaml       # Helm values for MongoDB
+├── kustomization.yaml          # Root Kustomize (aggregates db/ and app/)
+├── db/
+│   ├── kustomization.yaml
+│   ├── mongo-statefulset.yaml  # MongoDB StatefulSet (name: mongo)
+│   └── storageclass.yaml       # (optional) StorageClass override (gp3)
 └── app/
-    ├── kustomization.yaml    # app-only kustomize
-    ├── app.env               # non-sensitive env (ConfigMap generator)
-    ├── secret.yaml           # optional placeholder (or managed via CD)
-    ├── service.yaml          # Service for Flask API
-    └── deployment.yaml       # Deployment for Flask API
+    ├── kustomization.yaml
+    ├── configmap.yaml          # Non-sensitive app config (optional)
+    ├── secret.yaml             # Placeholder for secrets (or managed by CD)
+    ├── service.yaml            # Service (port 80 → targetPort 5000)
+    ├── ingress.yaml            # Ingress (ALB annotations, /health)
+    └── deployment.yaml         # App Deployment
 ```
 
 ## Prerequisites
-- **kubectl** configured for AWS EKS
+- **kubectl** configured to your EKS cluster
 - **Nginx Ingress Controller** installed in the cluster
 - **AWS CLI** with valid IAM permissions (via OIDC for GitHub Actions)
 - **ECR repository** with the latest app image pushed
@@ -57,8 +60,14 @@ kubectl get ingress -n fighting-characters
 
 Expected: External IP/DNS is assigned to the Ingress, app is accessible.
 
+
+### Storage
+- PVC name: `mongo-data-mongo-0` (from the StatefulSet `mongo`)
+- StorageClass: `gp3` (EBS)  
+
 ## CI/CD Pipeline
 Deployment is automated via GitHub Actions CD workflow:
+- CI (in the app repo) builds and pushes the Docker image to ECR and triggers this CD repo.
 - Triggered after pushing a new Docker image to AWS ECR
 - Uses OIDC to authenticate with AWS
 - Applies manifests with `kubectl apply -k k8/`
