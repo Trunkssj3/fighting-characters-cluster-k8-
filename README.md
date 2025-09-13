@@ -1,6 +1,6 @@
 # Fighting Characters – Kubernetes Manifests
 
-> Kubernetes manifests to **deploy** the Fighting Characters application on AWS EKS.
+> Kubernetes manifests to deploy the Fighting Characters application on AWS EKS.
 
 ## Overview
 This repository provides Kubernetes manifests and a Kustomize setup to deploy the Fighting Characters project on EKS.
