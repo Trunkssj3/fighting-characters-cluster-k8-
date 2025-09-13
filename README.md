@@ -24,18 +24,24 @@ Key components:
 
 ```
 k8/
-├── kustomization.yaml          # Root Kustomize (aggregates db/ and app/)
-├── db/
+├── app/
+│   ├── configmap.yaml
+│   ├── deployment.yaml
+│   ├── ingress.yaml
 │   ├── kustomization.yaml
-│   ├── mongo-statefulset.yaml  # MongoDB StatefulSet (name: mongo)
-│   └── storageclass.yaml       # (optional) StorageClass override (gp3)
-└── app/
-    ├── kustomization.yaml
-    ├── configmap.yaml          # Non-sensitive app config (optional)
-    ├── secret.yaml             # Placeholder for secrets (or managed by CD)
-    ├── service.yaml            # Service (port 80 → targetPort 5000)
-    ├── ingress.yaml            # Ingress (ALB annotations, /health)
-    └── deployment.yaml         # App Deployment
+│   ├── secret.yaml
+│   └── service.yaml
+├── db/
+│   ├── mongo-service.yaml
+│   └── mongo-statefulset.yaml
+├── infra/
+│   ├── storageclass-gp3.yaml
+│   ├── ingress.yaml
+│   ├── kustomization.yaml
+│   └── mongodb-values.yaml
+├── Diagram.png
+└── README.md
+
 ```
 
 ## Prerequisites
