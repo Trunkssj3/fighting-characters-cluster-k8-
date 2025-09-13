@@ -23,24 +23,28 @@ Key components:
 ## Repository Structure
 
 ```
-k8/
-├── app/
-│   ├── configmap.yaml
-│   ├── deployment.yaml
-│   ├── ingress.yaml
-│   ├── kustomization.yaml
-│   ├── secret.yaml
-│   └── service.yaml
-├── db/
-│   ├── mongo-service.yaml
-│   └── mongo-statefulset.yaml
-├── infra/
-│   ├── storageclass-gp3.yaml
-│   ├── ingress.yaml
-│   ├── kustomization.yaml
-│   └── mongodb-values.yaml
-├── Diagram.png
-└── README.md
+.
+├── .github/
+│   └── workflows/
+│       └── CD.yaml              
+├── k8/
+│   ├── app/
+│   │   ├── configmap.yaml
+│   │   ├── deployment.yaml
+│   │   ├── ingress.yaml
+│   │   ├── kustomization.yaml
+│   │   ├── secret.yaml
+│   │   └── service.yaml
+│   ├── db/
+│   │   ├── mongo-service.yaml
+│   │   └── mongo-statefulset.yaml
+│   ├── infra/
+│   │   ├── ingress.yaml
+│   │   ├── kustomization.yaml
+│   │   └── mongodb-values.yaml
+│   ├── Diagram.png
+│   └── README.md
+
 
 ```
 
